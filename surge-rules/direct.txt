@@ -1,2 +1,2 @@
 ip.cn
-meituan.net
+d.meituan.net

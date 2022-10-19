@@ -1,1 +1,2 @@
 ip.cn
+.ip.cn

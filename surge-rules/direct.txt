@@ -1,3 +1,4 @@
 .ip.cn
 .meituan.net
 .d.meituan.net
+maplocatesdksnapshot.d.meituan.net

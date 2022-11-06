@@ -1,0 +1,8 @@
+www.googleapis.com
+# oauth2.googleapis.com
+# oauthaccountmanager.googleapis.com
+# peoplestack-pa.googleapis.com
+# people-pa.googleapis.com
+# mtalk.google.com
+# voice.telephony.goog
+# lens.l.google.com

@@ -2,3 +2,4 @@
 .meituan.net
 sns.synology.com
 .lancygroup.com
+.quickconnect.cn

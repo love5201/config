@@ -1,3 +1,4 @@
 .ip.cn
 .meituan.net
 sns.synology.com
+.lancygroup.com

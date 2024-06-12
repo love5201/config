@@ -3,3 +3,4 @@
 sns.synology.com
 .lancygroup.com
 .quickconnect.cn
+oss-cn-beijing.aliyuncs.com

@@ -7,6 +7,7 @@ oss-cn-beijing.aliyuncs.com
 voip-tsm.ucloudlink.com
 mph5.ucloudlink.com
 .ucloudlink.com
+ucloudlink.com
 up135.com
 duoliao.up135.com
 jianguoyun.com

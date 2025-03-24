@@ -3,6 +3,7 @@
 sns.synology.com
 .lancygroup.com
 .quickconnect.cn
+.quickconnect.to
 oss-cn-beijing.aliyuncs.com
 voip-tsm.ucloudlink.com
 mph5.ucloudlink.com

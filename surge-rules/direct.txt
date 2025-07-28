@@ -1,3 +1,4 @@
+cdn.jsdelivr.net
 .ip.cn
 .meituan.net
 sns.synology.com

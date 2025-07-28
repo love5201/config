@@ -20,3 +20,5 @@ jianguoyun.com
 .ys7.com
 .ezviz.com
 .eziot.com
+daoway.cn
+.ele.me

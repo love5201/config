@@ -1,7 +1,6 @@
 .ip.cn
 .meituan.net
 sns.synology.com
-.lancygroup.com
 .quickconnect.cn
 .quickconnect.to
 oss-cn-beijing.aliyuncs.com
@@ -17,3 +16,6 @@ jianguoyun.com
 188.com
 .lancygroup.com
 .lancygroup.net
+.ys7.com
+.ezviz.com
+.eziot.com

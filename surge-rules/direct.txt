@@ -20,5 +20,12 @@ jianguoyun.com
 .ys7.com
 .ezviz.com
 .eziot.com
-daoway.cn
+.daoway.cn
 .ele.me
+.caiyunapp.com
+.caiyunai.com
+.caiyuncdn.com
+.cyapi.cn
+.amap.com
+.shenzhentong.com
+.shenzhenmc.com

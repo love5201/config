@@ -30,3 +30,6 @@
 .shenzhentong.com
 .shenzhenmc.com
 .tplinkcloud.com.cn
+.raisin.store
+.kkfile.com
+.tplogin.cn

@@ -33,3 +33,4 @@
 .raisin.store
 .kkfile.com
 .tplogin.cn
+.hixkl.com

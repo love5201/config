@@ -1,6 +1,7 @@
 .cdn.jsdelivr.net
 .ip.cn
 .meituan.net
+.meituan.com
 .sns.synology.com
 .synology.cn
 .quickconnect.cn

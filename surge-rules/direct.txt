@@ -37,3 +37,6 @@
 .kkfile.com
 .tplogin.cn
 .hixkl.com
+.servicewechat.com
+.wo116114.com
+.chinaunicom.cn

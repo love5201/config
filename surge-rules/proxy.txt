@@ -15,3 +15,4 @@
 .remaker.ai
 .boy.wiki
 .hostloc.com
+.idrive.com

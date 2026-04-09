@@ -16,3 +16,4 @@
 .boy.wiki
 .hostloc.com
 .idrive.com
+.wmsxwd-1.men

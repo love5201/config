@@ -20,3 +20,4 @@
 .x-air.org
 .gstatic.com
 .photoroom.com
+.faceswapper.ai

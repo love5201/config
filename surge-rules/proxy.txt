@@ -21,3 +21,4 @@
 .gstatic.com
 .photoroom.com
 .faceswapper.ai
+.pressplay.cc

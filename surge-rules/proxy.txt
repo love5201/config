@@ -23,3 +23,6 @@
 .faceswapper.ai
 .pressplay.cc
 .ikuuu.foo
+.ikuuu.pro
+.ikuuu.org
+.ikuuu.top

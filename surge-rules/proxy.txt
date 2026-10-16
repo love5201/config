@@ -22,3 +22,4 @@
 .photoroom.com
 .faceswapper.ai
 .pressplay.cc
+.ikuuu.foo

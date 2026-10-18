@@ -27,3 +27,4 @@
 .ikuuu.org
 .ikuuu.top
 .ikuuu.cc
+.lifehacker.tw

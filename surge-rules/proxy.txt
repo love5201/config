@@ -28,3 +28,4 @@
 .ikuuu.top
 .ikuuu.cc
 .lifehacker.tw
+.kapwing.com

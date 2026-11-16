@@ -41,3 +41,4 @@
 .wo116114.com
 .chinaunicom.cn
 .tencent.com
+.heptabase.com

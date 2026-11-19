@@ -80,8 +80,9 @@ def parse_anki_markdown(md_text: str, source_file: str = "", quiet: bool = False
                     print(f"⚠️ [{source_file}] 区块{idx}: 缺少 deck 字段，识别不到卡片，跳过")
                 else:
                     deck = deck.strip()
-                    if deck.startswith("#anki/"):
-                        deck = deck[len("#anki/"):]
+                    # ✅ 修改这里：#ankid/ 前缀
+                    if deck.startswith("#ankid/"):
+                        deck = deck[len("#ankid/"):]
                     deck_name = deck.replace("/", "::")
                     card_type = card_type.lower()
                     if card_type not in ("basic", "cloze"):

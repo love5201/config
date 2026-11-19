@@ -283,5 +283,20 @@ if __name__ == "__main__":
         print(f"目录不存在：{note_folder.resolve()}")
         exit(1)
     result_cards = scan_md_files(note_folder, quiet=args.quiet)
+
+    # ========= 新增：重复UUID校验 =========
+    uuid_list = [c["uuid"] for c in result_cards]
+    seen = set()
+    dup_set = set()
+    for uid in uuid_list:
+        if uid in seen:
+            dup_set.add(uid)
+        seen.add(uid)
+    if dup_set:
+        print(f"\n❌ 错误：检测到重复id(uuid)！重复id列表：{sorted(dup_set)}")
+        print("❌ 终止执行，不会推送Anki、不会删除卡片、不会生成tsv！")
+        exit(1)
+    # ======================================
+
     push_to_anki(result_cards, toanki=args.toanki, allow_delete=args.allow_delete, quiet=args.quiet)
     export_tsv(result_cards, "anki_export.tsv")

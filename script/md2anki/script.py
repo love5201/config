@@ -80,7 +80,6 @@ def parse_anki_markdown(md_text: str, source_file: str = "", quiet: bool = False
                     print(f"⚠️ [{source_file}] 区块{idx}: 缺少 deck 字段，识别不到卡片，跳过")
                 else:
                     deck = deck.strip()
-                    # ✅ 修改这里：#ankid/ 前缀
                     if deck.startswith("#ankid/"):
                         deck = deck[len("#ankid/"):]
                     deck_name = deck.replace("/", "::")
@@ -91,6 +90,8 @@ def parse_anki_markdown(md_text: str, source_file: str = "", quiet: bool = False
                         tags = []
                         if tag_str:
                             tags = [t.strip() for t in tag_str.split(",") if t.strip()]
+                        # 自动追加 bear-app，去重
+                        tags = list(set(tags + ["bear-app"]))
                         card = {
                             "uuid": uuid_val,
                             "type": card_type,
@@ -143,7 +144,7 @@ def push_to_anki(cards: List[Dict], toanki: bool = False, allow_delete: bool = F
             tags = card["tags"]
             suspend_flag = card["suspend"]
             if not quiet:
-                print(f"🔄 uuid={uuid_val}, deck={deck_name}, suspend={suspend_flag}")
+                print(f"🔄 uuid={uuid_val}, deck={deck_name}, suspend={suspend_flag}, tags={tags}")
             if deck_name not in deck_list:
                 if not quiet:
                     print(f"📂 卡组不存在，自动创建: {deck_name}")
@@ -163,16 +164,21 @@ def push_to_anki(cards: List[Dict], toanki: bool = False, allow_delete: bool = F
                 note_fields["uuid"] = uuid_val
                 model_name = "Cloze-md2anki"
             if note_id is not None:
+                # 更新字段
                 anki_invoke("updateNoteFields", {
                     "note": {
                         "id": note_id,
-                        "fields": note_fields,
-                        "tags": tags
+                        "fields": note_fields
                     }
+                })
+                # 单独更新标签（覆盖式）
+                anki_invoke("updateNoteTags", {
+                    "note": note_id,
+                    "tags": tags
                 })
                 card_ids = anki_invoke("findCards", {"query": f"nid:{note_id}"})
                 if not quiet:
-                    print(f"♻️ 更新笔记 note_id={note_id}, card_ids={card_ids}")
+                    print(f"♻️ 更新笔记 note_id={note_id}, card_ids={card_ids}, new_tags={tags}")
                 deck_map = anki_invoke("getDecks", {"cards": card_ids})
                 cid_to_deck = {}
                 for dname, cids in deck_map.items():
@@ -261,10 +267,11 @@ def push_to_anki(cards: List[Dict], toanki: bool = False, allow_delete: bool = F
 def export_tsv(cards: List[Dict], out_path: str):
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         for c in cards:
+            tag_str = ",".join(c["tags"])
             if c["type"] == "basic":
-                line = f"{c['uuid']}\t{c['front']}\t{c['back']}\t{c['deck']}\t{c['suspend']}\n"
+                line = f"{c['uuid']}\t{c['front']}\t{c['back']}\t{c['deck']}\t{tag_str}\t{c['suspend']}\n"
             else:
-                line = f"{c['uuid']}\t{c['text']}\t{c['extra']}\t{c['deck']}\t{c['suspend']}\n"
+                line = f"{c['uuid']}\t{c['text']}\t{c['extra']}\t{c['deck']}\t{tag_str}\t{c['suspend']}\n"
             f.write(line)
 
 

@@ -1,141 +1,130 @@
-# md2anki 同步脚本 README
+# md2anki 脚本 README
 
-> 
-> Markdown → Anki 双向同步脚本，基于 AnkiConnect，使用 `<anki>` 标签管理卡片
+## 功能简介
 
-## ✨ 功能特性
+把 Markdown 文件里自定义的 `<anki>` 卡片同步到 Anki，基于 Anki-Connect。
 
-1. **从 Markdown 目录批量导入卡片**
-   - 识别 md 文件内 `<anki id="" type="" tags="">` 区块
-   - 支持两种卡片类型：`basic`（正反面）、`cloze`（填空挖空）
-   - 自动映射 `#anki/a/b` 格式为 Anki 层级卡组 `a::b`
-   - 不存在的卡组自动创建
-2. **增量更新卡片**
-   - 根据 `id(uuid)` 作为卡片唯一标识
-   - 相同 uuid：更新字段、标签、移动到目标卡组
-   - 新 uuid：新增笔记
-3. **清理逻辑（--allow-delete）【重点规则】**
-   - 只删除**本次md中不存在uuid对应的笔记**
-   - 笔记删除后：**仅检查这批笔记原来所属的卡组**，其余卡组完全不扫描、不改动
-   - 叶子子卡组：删笔记后为空 → 自动删除该子卡组
-   - 向上递归遍历它所有父卡组：判断是否为空，**仅打印告警提示，不会自动删除父卡组**
-4. **导出 TSV**
- 每次运行自动输出 `anki_export.tsv`，方便备份、核对卡片
-5. **预览模式**
- 不加 `--toanki`，只解析打印卡片，不会修改 Anki
+- ✅ 支持 basic / cloze 两种卡片类型
+- ✅ 可选 `suspend` 布尔标记：带则暂停卡片，不带则取消暂停
+- ✅ 自动转换路径：`#anki/地理/中国地理` → Anki卡组 `地理::中国地理`
+- ✅ 全局 UUID（id）查重，重复直接终止，防止冲突
+- ✅ 更新已有笔记、新建笔记、自动移动卡片到目标卡组
+- ✅ `--allow-delete` 模式：删掉md里不存在的笔记；删除后自动清理空的**子卡组**，父卡组只告警不删除
+- ✅ 导出 `anki_export.tsv` 备份（包含 suspend 状态）
+- ✅ 调试日志：新增/更新打印 note_id、card_ids；quiet 参数关闭 debug 输出
 
-## 📋 前置依赖
+## 前置依赖
 
-1. Anki 安装插件：[AnkiConnect](https://foosoft.net/projects/anki-connect/)
-2. Anki 中提前建好两个笔记类型（model），名称严格一致：
-   - `Basic-md2anki`：字段 `front, back, uuid`
-   - `Cloze-md2anki`：字段 `text, extra, uuid`
-3. Python 依赖包
+1. Anki 安装插件：Anki-Connect，地址：[https://foosoft.net/projects/anki-connect/](https://foosoft.net/projects/anki-connect/)
+2. 开启 Anki，保证 Anki-Connect 监听 `[http://localhost:8765](http://localhost:8765)`
+3. Python 依赖
 
 ```
 pip install pyyaml requests
 ```
 
-## 📝 Markdown 写法示例
+4. 在Anki中提前建好两个笔记类型（模型名称严格一致）
 
-### Basic 卡片
+- `Basic-md2anki`：字段 `front`、`back`、`uuid`
+- `Cloze-md2anki`：字段 `text`、`extra`、`uuid`> 
+> ⚠️ uuid 字段必须存在，脚本依靠此字段定位笔记
+
+## 语法示例
+
+### 1. basic（问答卡片，不暂停）
 
 ```
-<anki id="note_001" type="basic" tags="python,基础">
-deck: #anki/python/基础
-front: 什么是 Python ?
-back: Python 是一门解释型高级编程语言
+<anki id="b001" type="basic" tags="计算机网络,TCP">
+deck: #anki/计算机网络
+front: TCP和UDP区别？
+back: 1.TCP面向连接；UDP无连接
+2.TCP可靠；UDP不可靠
 </anki>
 ```
 
-### Cloze 挖空卡片
+### 2. cloze（挖空卡片，suspend暂停）
 
 ```
-<anki id="note_002" type="cloze" tags="linux">
-deck: #anki/linux/命令
-text: ls 命令用于{{c1::列出目录内容}}
-extra: 常用参数 -l 长格式
+<anki id="abc002" type="cloze" tags="地理,首都" suspend>
+deck: #anki/地理/中国地理
+text: 中国的首都是{{c1::北京}}
+extra: 拓展：北京是直辖市
 </anki>
 ```
 
-> 
-> ✅ deck 路径 `#anki/a/b` 会自动转为 Anki 卡组 `a::b`
+- 属性说明
+  - `id`：全局唯一标识（uuid），**不可重复**
+  - `type`：`basic` / `cloze`
+  - `tags`：逗号分隔标签，可选
+  - `suspend`：布尔标记，只写关键字、不用赋值；有则暂停，无则取消暂停
+  - `deck`：`#anki/` 开头，`/` 自动转为Anki卡组分隔符 `::`
+- 标签必须成对闭合：`<anki> ... </anki>`
 
-## 🚀 运行命令
-
-### 预览（推荐先跑这个，不改动Anki）
-
-```
-python script.py ./notes
-```
-
-### 正式推送，写入Anki，不开启删除
+## 命令使用
 
 ```
-python script.py ./notes --toanki
+# 预览模式：只解析打印，不写入Anki
+python md2anki.py ./notes
+
+# 写入Anki（不自动删除，只新增/更新）
+python md2anki.py ./notes --toanki
+
+# 写入Anki + 开启自动删除（md中消失的笔记会被Anki删除，同步清理空子卡组）
+python md2anki.py ./notes --toanki --allow-delete
+
+# 安静模式，关闭debug日志
+python md2anki.py ./notes --toanki --quiet
 ```
 
-### 正式推送 + 开启清理（删除md不存在笔记 + 空子卡组自动清理、空父卡组仅提示）
+## 执行流程
+
+1. 扫描目标目录全部 `.md` 文件，提取 `<anki>` 块
+2. 校验所有 id，存在重复 → 直接退出，不做任何改动
+3. 预览模式：输出解析结果，结束
+4. toanki 模式：
+   - 根据 uuid 查询Anki笔记
+   - 找到：更新字段、标签、移动卡组，同步 suspend 状态
+   - 没找到：新建笔记，同步 suspend 状态
+5. 开启 `--allow-delete`：
+   - 找出Anki内uuid在本次md中不存在的笔记，批量删除
+   - 遍历被删除笔记所属卡组，空子卡组自动删除
+   - 父卡组为空只打印警告，不会删除
+6. 导出 `anki_export.tsv`
+
+## 日志标识
+
+- `🔄` 处理卡片
+- `➕` 新增笔记
+- `♻️` 更新笔记
+- `📂` 自动创建卡组
+- `📦` 卡片移动卡组
+- `⏸️` 暂停卡片
+- `▶️` 取消暂停卡片
+- `🗑️` 删除笔记
+- `🧹` 删除空的子卡组
+- `⚠️` 警告，不会中断流程
+- `❌` 错误，单条卡片失败不影响其他卡片继续执行
+
+## 注意事项 & 避坑
+
+1. Anki必须保持打开状态，Anki-Connect正常运行，否则报错
+2. 模型名称、字段名称不能写错（Basic-md2anki / Cloze-md2anki）
+3. id一旦分配尽量不要修改；修改id脚本会当成一条全新笔记新增
+4. suspend 是卡片状态，每次同步都会按md标记强制覆盖Anki里原有暂停状态
+5. `--allow-delete` 是高危参数：md删掉anki块，anki笔记就会被删除，重要笔记谨慎使用
+6. cloze 的 text 里必须包含 `{{c1::内容}}` 挖空语法，否则会跳过该卡片
+7. 导出文件 `anki_export.tsv` 在脚本同目录，每次运行覆盖
+
+## 文件结构示例
 
 ```
-python script.py ./notes --toanki --allow-delete
-```
-
-### 安静模式（关闭调试打印）
-
-```
-python script.py ./notes --toanki --allow-delete --quiet
-```
-
-## ⚠️ 清理逻辑详细说明（--allow-delete）
-
-举例子：
-
-- md 删掉 `数学::数学2` 下全部卡片
-
-1. 脚本删除该uuid笔记
-2. 只检查卡组 `数学::数学2`
-3. `数学::数学2` 无卡片 → **自动删除这个子卡组**
-4. 向上找到父卡组 `数学`，检查 `数学` 是否为空
-5. 如果父卡组为空 → 控制台打印警告，**不会删除父卡组**
-6. 其他无关卡组（英语、物理等）全程不触碰
-
-> 
-> 规则一句话：**本次删了卡片，才去处理对应的卡组；别的卡组不动。子空删子，父空只提示。**
-
-## 📁 目录结构建议
-
-```
-./notes/
-├─ math.md
-├─ python.md
-└─ linux.md
-script.py
+md2anki.py
+notes/
+├─ input.md
+└─ 地理.md
 anki_export.tsv
 ```
 
-## ❗ 注意事项
+---
 
-1. `id` 必须全局唯一，作为卡片主键，不要重复
-2. Anki 必须保持打开，AnkiConnect 插件正常启用
-3. 脚本删除卡片是 AnkiConnect 的删除笔记接口，删除后卡片不可恢复，建议先备份Anki库
-4. 脚本不会自动新建笔记模型（Basic-md2anki / Cloze-md2anki），需要你手动在Anki提前建好
-5. 标签用英文逗号分隔，前后空格会自动剔除
-
-## 📤 输出文件
-
-`anki_export.tsv`
-
-- basic：uuid | front | back | deck
-- cloze：uuid | text | extra | deck
-
-## 📌 参数列表
-
-| 参数 | 说明 |
-| --- | --- |
-| dir | 笔记md文件夹路径，默认 `./notes` |
-| --toanki | 开启写入Anki；不加则仅预览 |
-| --allow-delete | 开启删除&空卡组清理逻辑，谨慎使用 |
-| --quiet | 安静模式，关闭debug日志 |
-
-如果你想要，我可以再给一份精简版 README（适合放github，更短）。
+如果你想，我可以再单独写一个【快速检查脚本】，只扫描md，检查有没有重复id、语法错误，不碰Anki。

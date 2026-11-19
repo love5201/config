@@ -20,11 +20,6 @@ def escape_anki(s: str) -> str:
     return s.replace('"', '\\"')
 
 def get_parent_deck_chain(deck_name: str) -> List[str]:
-    """
-    输入 数学::数学2
-    返回父链：["数学"]
-    输入 A::B::C，返回 ["A::B", "A"]
-    """
     parts = deck_name.split("::")
     parents = []
     for i in range(len(parts)-1, 0, -1):
@@ -45,7 +40,8 @@ def parse_anki_markdown(md_text: str, source_file: str = "", quiet: bool = False
     attr_pat = re.compile(
         r"""id=(['\"])(?P<id>.+?)\1\s*"""
         r"""type=(['\"])(?P<type>.+?)\3\s*"""
-        r"""(?:tags=(['\"])(?P<tags>.*?)\5)?"""
+        r"""(?:tags=(['\"])(?P<tags>.*?)\5)?\s*"""
+        r"""(?P<suspend_flag>suspend\b)?"""
     )
     for idx, m in enumerate(all_matches):
         attrs_raw = m.group("attrs")
@@ -59,6 +55,8 @@ def parse_anki_markdown(md_text: str, source_file: str = "", quiet: bool = False
         uuid_val = gd_attr["id"].strip()
         card_type = gd_attr["type"].strip()
         tag_str = gd_attr.get("tags")
+        need_suspend = bool(gd_attr.get("suspend_flag"))
+
         if not raw_block:
             print(f"⚠️ [{source_file}] 区块{idx}: <anki></anki> 内为空，识别不到卡片，跳过")
             continue
@@ -97,6 +95,7 @@ def parse_anki_markdown(md_text: str, source_file: str = "", quiet: bool = False
                             "type": card_type,
                             "deck": deck_name,
                             "tags": tags,
+                            "suspend": need_suspend
                         }
                         if card_type == "basic":
                             front = meta.get("front")
@@ -135,15 +134,15 @@ def push_to_anki(cards: List[Dict], toanki: bool = False, allow_delete: bool = F
         return
     print("===== 🚀 正式推送模式 =====")
     local_uuid_set = {c["uuid"] for c in cards}
-    used_decks = {c["deck"] for c in cards}
     deck_list = anki_invoke("deckNames")
     for card in cards:
         try:
             uuid_val = card["uuid"]
             deck_name = card["deck"]
             tags = card["tags"]
+            suspend_flag = card["suspend"]
             if not quiet:
-                print(f"🔄 uuid={uuid_val}, deck={deck_name}")
+                print(f"🔄 uuid={uuid_val}, deck={deck_name}, suspend={suspend_flag}")
             if deck_name not in deck_list:
                 if not quiet:
                     print(f"📂 卡组不存在，自动创建: {deck_name}")
@@ -171,6 +170,8 @@ def push_to_anki(cards: List[Dict], toanki: bool = False, allow_delete: bool = F
                     }
                 })
                 card_ids = anki_invoke("findCards", {"query": f"nid:{note_id}"})
+                if not quiet:
+                    print(f"♻️ 更新笔记 note_id={note_id}, card_ids={card_ids}")
                 deck_map = anki_invoke("getDecks", {"cards": card_ids})
                 cid_to_deck = {}
                 for dname, cids in deck_map.items():
@@ -189,8 +190,19 @@ def push_to_anki(cards: List[Dict], toanki: bool = False, allow_delete: bool = F
                     "fields": note_fields,
                     "tags": tags
                 }
-                anki_invoke("addNote", {"note": note_param})
-                print(f"➕ 新增卡片 uuid={uuid_val}")
+                note_id = anki_invoke("addNote", {"note": note_param})
+                card_ids = anki_invoke("findCards", {"query": f"nid:{note_id}"})
+                print(f"➕ 新增笔记 uuid={uuid_val}, note_id={note_id}, card_ids={card_ids}")
+
+            if note_id is not None:
+                card_ids = anki_invoke("findCards", {"query": f"nid:{note_id}"})
+                if suspend_flag:
+                    anki_invoke("suspend", {"cards": card_ids})
+                    print(f"⏸️ 暂停卡片 {card_ids}")
+                else:
+                    anki_invoke("unsuspend", {"cards": card_ids})
+                    print(f"▶️ 取消暂停卡片 {card_ids}")
+
         except Exception as e:
             print(f"❌ 处理卡片异常 {card}: {e}")
 
@@ -224,16 +236,13 @@ def push_to_anki(cards: List[Dict], toanki: bool = False, allow_delete: bool = F
             parent_empty_warn = set()
 
             for dk in deleted_note_decks:
-                # 判断当前这个（叶子）卡组
                 if is_deck_empty(dk):
                     deck_to_delete.append(dk)
-                # 向上拿到所有父卡组
                 parents = get_parent_deck_chain(dk)
                 for p in parents:
                     if is_deck_empty(p):
                         parent_empty_warn.add(p)
 
-            # 删除空子卡组
             if deck_to_delete:
                 del_list = sorted(deck_to_delete, key=lambda x: x.count("::"), reverse=True)
                 anki_invoke("deleteDecks", {"decks": del_list, "cardsToo": True})
@@ -241,7 +250,6 @@ def push_to_anki(cards: List[Dict], toanki: bool = False, allow_delete: bool = F
             else:
                 print("✅ 本次删卡对应的子卡组均还有卡片，无需删除")
 
-            # 父卡组只提示，不删
             if parent_empty_warn:
                 print(f"⚠️ 检测到以下父卡组为空（仅提示，不会自动删除）: {sorted(parent_empty_warn)}")
 
@@ -253,9 +261,9 @@ def export_tsv(cards: List[Dict], out_path: str):
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         for c in cards:
             if c["type"] == "basic":
-                line = f"{c['uuid']}\t{c['front']}\t{c['back']}\t{c['deck']}\n"
+                line = f"{c['uuid']}\t{c['front']}\t{c['back']}\t{c['deck']}\t{c['suspend']}\n"
             else:
-                line = f"{c['uuid']}\t{c['text']}\t{c['extra']}\t{c['deck']}\n"
+                line = f"{c['uuid']}\t{c['text']}\t{c['extra']}\t{c['deck']}\t{c['suspend']}\n"
             f.write(line)
 
 
@@ -284,7 +292,7 @@ if __name__ == "__main__":
         exit(1)
     result_cards = scan_md_files(note_folder, quiet=args.quiet)
 
-    # ========= 新增：重复UUID校验 =========
+    # 重复UUID校验
     uuid_list = [c["uuid"] for c in result_cards]
     seen = set()
     dup_set = set()
@@ -296,7 +304,6 @@ if __name__ == "__main__":
         print(f"\n❌ 错误：检测到重复id(uuid)！重复id列表：{sorted(dup_set)}")
         print("❌ 终止执行，不会推送Anki、不会删除卡片、不会生成tsv！")
         exit(1)
-    # ======================================
 
     push_to_anki(result_cards, toanki=args.toanki, allow_delete=args.allow_delete, quiet=args.quiet)
     export_tsv(result_cards, "anki_export.tsv")

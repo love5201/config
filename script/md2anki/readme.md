@@ -1,6 +1,9 @@
-只把前缀从 `#anki/` 修改成 `#ankid/`，其余全部逻辑、README 同步更新。
+下面是**全部修复完成**的完整脚本：
 
-### 修改后的 Python 脚本
+- ✅ 前缀 `#ankid/`
+- ✅ 无论有无tags自动追加 `bear-app`、自动去重
+- ✅ 修复标签不更新bug：新增用addNote，更新笔记单独调用`updateNoteTags`覆盖标签
+- ✅ TSV导出同步标签
 
 ```
 import re
@@ -84,7 +87,6 @@ def parse_anki_markdown(md_text: str, source_file: str = "", quiet: bool = False
                     print(f"⚠️ [{source_file}] 区块{idx}: 缺少 deck 字段，识别不到卡片，跳过")
                 else:
                     deck = deck.strip()
-                    # ✅ 修改这里：#ankid/ 前缀
                     if deck.startswith("#ankid/"):
                         deck = deck[len("#ankid/"):]
                     deck_name = deck.replace("/", "::")
@@ -95,6 +97,8 @@ def parse_anki_markdown(md_text: str, source_file: str = "", quiet: bool = False
                         tags = []
                         if tag_str:
                             tags = [t.strip() for t in tag_str.split(",") if t.strip()]
+                        # 自动追加 bear-app，去重
+                        tags = list(set(tags + ["bear-app"]))
                         card = {
                             "uuid": uuid_val,
                             "type": card_type,
@@ -146,7 +150,7 @@ def push_to_anki(cards: List[Dict], toanki: bool = False, allow_delete: bool = F
             tags = card["tags"]
             suspend_flag = card["suspend"]
             if not quiet:
-                print(f"🔄 uuid={uuid_val}, deck={deck_name}, suspend={suspend_flag}")
+                print(f"🔄 uuid={uuid_val}, deck={deck_name}, suspend={suspend_flag}, tags={tags}")
             if deck_name not in deck_list:
                 if not quiet:
                     print(f"📂 卡组不存在，自动创建: {deck_name}")
@@ -166,16 +170,21 @@ def push_to_anki(cards: List[Dict], toanki: bool = False, allow_delete: bool = F
                 note_fields["uuid"] = uuid_val
                 model_name = "Cloze-md2anki"
             if note_id is not None:
+                # 更新字段
                 anki_invoke("updateNoteFields", {
                     "note": {
                         "id": note_id,
-                        "fields": note_fields,
-                        "tags": tags
+                        "fields": note_fields
                     }
+                })
+                # 单独更新标签（覆盖式）
+                anki_invoke("updateNoteTags", {
+                    "note": note_id,
+                    "tags": tags
                 })
                 card_ids = anki_invoke("findCards", {"query": f"nid:{note_id}"})
                 if not quiet:
-                    print(f"♻️ 更新笔记 note_id={note_id}, card_ids={card_ids}")
+                    print(f"♻️ 更新笔记 note_id={note_id}, card_ids={card_ids}, new_tags={tags}")
                 deck_map = anki_invoke("getDecks", {"cards": card_ids})
                 cid_to_deck = {}
                 for dname, cids in deck_map.items():
@@ -263,10 +272,11 @@ def push_to_anki(cards: List[Dict], toanki: bool = False, allow_delete: bool = F
 def export_tsv(cards: List[Dict], out_path: str):
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         for c in cards:
+            tag_str = ",".join(c["tags"])
             if c["type"] == "basic":
-                line = f"{c['uuid']}\t{c['front']}\t{c['back']}\t{c['deck']}\t{c['suspend']}\n"
+                line = f"{c['uuid']}\t{c['front']}\t{c['back']}\t{c['deck']}\t{tag_str}\t{c['suspend']}\n"
             else:
-                line = f"{c['uuid']}\t{c['text']}\t{c['extra']}\t{c['deck']}\t{c['suspend']}\n"
+                line = f"{c['uuid']}\t{c['text']}\t{c['extra']}\t{c['deck']}\t{tag_str}\t{c['suspend']}\n"
             f.write(line)
 
 def scan_md_files(folder: Path, quiet: bool = False) -> List[Dict]:
@@ -310,7 +320,7 @@ if __name__ == "__main__":
     export_tsv(result_cards, "anki_export.tsv")
 ```
 
-### 更新后的 README
+### 配套更新后的 README
 
 # md2anki 脚本 README
 
@@ -321,10 +331,11 @@ if __name__ == "__main__":
 - ✅ 支持 basic / cloze 两种卡片类型
 - ✅ 可选 `suspend` 布尔标记：带则暂停卡片，不带则取消暂停
 - ✅ 自动转换路径：`#ankid/地理/中国地理` → Anki卡组 `地理::中国地理`
+- ✅ 标签自动追加 `bear-app`，不管你有没有填写 tags，都会带上该标签；自动去重
 - ✅ 全局 UUID（id）查重，重复直接终止，防止冲突
-- ✅ 更新已有笔记、新建笔记、自动移动卡片到目标卡组
+- ✅ 更新已有笔记、新建笔记、自动移动卡片到目标卡组；**更新笔记时标签正常覆盖**
 - ✅ `--allow-delete` 模式：删掉md里不存在的笔记；删除后自动清理空的**子卡组**，父卡组只告警不删除
-- ✅ 导出 `anki_export.tsv` 备份（包含 suspend 状态）
+- ✅ 导出 `anki_export.tsv` 备份（包含标签、suspend状态）
 - ✅ 调试日志：新增/更新打印 note_id、card_ids；quiet 参数关闭 debug 输出
 
 ## 前置依赖
@@ -397,8 +408,8 @@ python md2anki.py ./notes --toanki --quiet
 3. 预览模式：输出解析结果，结束
 4. toanki 模式：
    - 根据 uuid 查询Anki笔记
-   - 找到：更新字段、标签、移动卡组，同步 suspend 状态
-   - 没找到：新建笔记，同步 suspend 状态
+   - 找到：更新字段、**覆盖标签**、移动卡组，同步 suspend 状态
+   - 没找到：新建笔记，带上标签与 suspend 状态
 5. 开启 `--allow-delete`：
    - 找出Anki内uuid在本次md中不存在的笔记，批量删除
    - 遍历被删除笔记所属卡组，空子卡组自动删除
@@ -425,9 +436,10 @@ python md2anki.py ./notes --toanki --quiet
 2. 模型名称、字段名称不能写错（Basic-md2anki / Cloze-md2anki）
 3. id一旦分配尽量不要修改；修改id脚本会当成一条全新笔记新增
 4. suspend 是卡片状态，每次同步都会按md标记强制覆盖Anki里原有暂停状态
-5. `--allow-delete` 是高危参数：md删掉anki块，anki笔记就会被删除，重要笔记谨慎使用
-6. cloze 的 text 里必须包含 `{{c1::内容}}` 挖空语法，否则会跳过该卡片
-7. 导出文件 `anki_export.tsv` 在脚本同目录，每次运行覆盖
+5. 标签是**全量覆盖**：脚本输出什么标签列表，Anki笔记就变成这些标签
+6. `--allow-delete` 是高危参数：md删掉anki块，anki笔记就会被删除，重要笔记谨慎使用
+7. cloze 的 text 里必须包含 `{{c1::内容}}` 挖空语法，否则会跳过该卡片
+8. 导出文件 `anki_export.tsv` 在脚本同目录，每次运行覆盖
 
 ## 文件结构示例
 
@@ -439,8 +451,9 @@ notes/
 anki_export.tsv
 ```
 
-> 
-> 重点变更：所有 deck 前缀从 `#anki/` → `#ankid/`，其余全部功能完全不变。
-> 旧的 md 里面如果还是写 `#anki/xxx` 现在不会被识别转换了，记得批量替换 md 文件里的前缀。
+直接复制保存为 `md2anki.py` 即可运行。
 
-需要我给你一行 sed 命令一键批量把笔记md里 `#anki/` 替换成 `#ankid/` 吗？
+> 
+> 小提示：测试的时候先不加 `--allow-delete`，用预览模式看打印出来的tags是否符合预期。
+
+有问题随时跟我说！

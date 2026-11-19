@@ -33,6 +33,7 @@ def is_deck_empty(dk: str) -> bool:
 
 def parse_anki_markdown(md_text: str, source_file: str = "", quiet: bool = False) -> List[Dict]:
     cards = []
+    # ========== 原有 <anki> 块解析，完全保留 ==========
     all_block_pat = re.compile(r"<anki\s*(?P<attrs>[^>]*)>(?P<content>.*?)</anki>", re.DOTALL)
     all_matches = list(all_block_pat.finditer(md_text))
     if not quiet:
@@ -90,7 +91,6 @@ def parse_anki_markdown(md_text: str, source_file: str = "", quiet: bool = False
                         tags = []
                         if tag_str:
                             tags = [t.strip() for t in tag_str.split(",") if t.strip()]
-                        # 自动追加 bear-app，去重
                         tags = list(set(tags + ["bear-app"]))
                         card = {
                             "uuid": uuid_val,
@@ -125,6 +125,101 @@ def parse_anki_markdown(md_text: str, source_file: str = "", quiet: bool = False
             print(f"⚠️ [{source_file}] 区块{idx}: YAML解析失败 {e}，识别不到卡片，跳过")
         if not ok:
             print(f"⚠️ [{source_file}] 区块{idx}: <anki>标签解析完成，但未生成有效卡片，请检查内容")
+
+    # ========== 新增：短横线简易格式解析（方案B：单注释 ; 分隔属性） ==========
+    lines = md_text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # 条件：- 半角空格开头、包含 #ankid、包含 <!-- anki-id: -->
+        if re.match(r"^- ", line) and "#ankid" in line and "<!-- anki-id:" in line:
+            # 提取注释块内全部属性
+            attr_m = re.search(r"<!--\s*(?P<props>anki-id:.+?)\s*-->", line)
+            if not attr_m:
+                print(f"⚠️ [{source_file}] 简易行解析错误，找不到属性注释：{line}")
+                i += 1
+                continue
+            prop_raw = attr_m.group("props")
+            prop_parts = [p.strip() for p in prop_raw.split(";") if p.strip()]
+            prop_dict = {}
+            for part in prop_parts:
+                if ":" in part:
+                    k, v = part.split(":", 1)
+                    prop_dict[k.strip()] = v.strip()
+                else:
+                    # 无值flag，例如 suspend
+                    prop_dict[part.strip()] = True
+            uuid_val = prop_dict.get("anki-id")
+            if not uuid_val:
+                print(f"⚠️ [{source_file}] 简易行解析错误，anki-id缺失：{line}")
+                i += 1
+                continue
+            need_suspend = "suspend" in prop_dict
+
+            # 提取 #ankid/xxx 牌组
+            deck_m = re.search(r"#ankid/([\w/]+)", line)
+            if not deck_m:
+                print(f"⚠️ [{source_file}] 简易行解析错误，找不到#ankid路径：{line}")
+                i += 1
+                continue
+            deck_raw = deck_m.group(1)
+            deck_name = deck_raw.replace("/", "::")
+
+            # 去掉注释、#ankid标记，拿到主体文本
+            main_text = re.sub(r"<!--\s*anki-id:.+?\s*-->", "", line)
+            main_text = re.sub(r"#ankid/[\w/]+", "", main_text).strip("- ").strip()
+
+            extra_lines = []
+            # 收集后续缩进子项作为extra
+            j = i + 1
+            while j < len(lines):
+                subline = lines[j]
+                if re.match(r"^\s+- ", subline):
+                    extra_lines.append(subline.strip("- ").strip())
+                    j += 1
+                else:
+                    break
+            extra = "\n".join(extra_lines)
+
+            if "::" in main_text:
+                # basic 正反面分割
+                front, back = main_text.split("::", 1)
+                front = front.strip()
+                back = back.strip()
+                card = {
+                    "uuid": uuid_val,
+                    "type": "basic",
+                    "deck": deck_name,
+                    "tags": ["bear-app"],
+                    "suspend": need_suspend,
+                    "front": front,
+                    "back": back
+                }
+                cards.append(card)
+                if not quiet:
+                    print(f"✅ [{source_file}] 简易Basic解析成功 uuid={uuid_val}, suspend={need_suspend}")
+            else:
+                # cloze：*xxx* → {{c1::xxx}}
+                cloze_text = re.sub(r"\*(.+?)\*", r"{{c1::\1}}", main_text)
+                if not re.search(r"{{c1::", cloze_text):
+                    print(f"⚠️ [{source_file}] 简易cloze解析错误，无斜体挖空：{line}")
+                    i = j
+                    continue
+                card = {
+                    "uuid": uuid_val,
+                    "type": "cloze",
+                    "deck": deck_name,
+                    "tags": ["bear-app"],
+                    "suspend": need_suspend,
+                    "text": cloze_text,
+                    "extra": extra
+                }
+                cards.append(card)
+                if not quiet:
+                    print(f"✅ [{source_file}] 简易Cloze解析成功 uuid={uuid_val}, suspend={need_suspend}")
+            i = j
+        else:
+            i += 1
     return cards
 
 
@@ -164,14 +259,12 @@ def push_to_anki(cards: List[Dict], toanki: bool = False, allow_delete: bool = F
                 note_fields["uuid"] = uuid_val
                 model_name = "Cloze-md2anki"
             if note_id is not None:
-                # 更新字段
                 anki_invoke("updateNoteFields", {
                     "note": {
                         "id": note_id,
                         "fields": note_fields
                     }
                 })
-                # 单独更新标签（覆盖式）
                 anki_invoke("updateNoteTags", {
                     "note": note_id,
                     "tags": tags
@@ -288,7 +381,7 @@ def scan_md_files(folder: Path, quiet: bool = False) -> List[Dict]:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Markdown同步Anki脚本")
+    parser = argparse.ArgumentParser(description="Markdown同步Anki脚本，支持两种格式：<anki>块 + 简易-列表行，方案B属性注释")
     parser.add_argument("dir", nargs="?", default="./notes", help="笔记目录")
     parser.add_argument("--toanki", action="store_true", help="写入Anki；不加仅预览")
     parser.add_argument("--allow-delete", action="store_true", help="删除md不存在笔记；空子卡组自动删，空父卡组仅打印提示不删除；无关卡组不动")
@@ -300,7 +393,6 @@ if __name__ == "__main__":
         exit(1)
     result_cards = scan_md_files(note_folder, quiet=args.quiet)
 
-    # 重复UUID校验
     uuid_list = [c["uuid"] for c in result_cards]
     seen = set()
     dup_set = set()

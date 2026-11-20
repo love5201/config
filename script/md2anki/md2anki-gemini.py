@@ -13,10 +13,12 @@ import requests
 
 ANKI_CONNECT_URL = "http://localhost:8765"
 CLOZE_PATTERN = re.compile(r"\{\{\s*(.+?)\s*\}\}")
-# 匹配 #toanki/xxx/yyy [@suspend]
-DECK_HEAD_PATTERN = re.compile(r"^#toanki/(.+?)(?:\s+@suspend)?\s*$")
-# 匹配简易行中的 #toanki/... 卡组标记（遇到空白或注释前停止）
-INLINE_DECK_PATTERN = re.compile(r"#toanki/[^\s]+")
+# 匹配 %% 注释 %% 跨行，非贪婪
+COMMENT_BLOCK_PATTERN = re.compile(r"%%.*?%%", re.DOTALL)
+# 匹配独占一行的 --- 分隔符
+CARD_SEP_PATTERN = re.compile(r"(?m)^---\s*$")
+# 匹配 #toanki/xxx/yyy  [可选 @suspend]
+DECK_HEAD_PATTERN = re.compile(r"^#toanki/(.*?)(\s+@suspend)?\s*$")
 MD_IMAGE_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
 SINGLE_IMAGE_LINE_PATTERN = re.compile(
     r"^\s*!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)\s*(?:<!--.*?-->\s*)?$"
@@ -50,7 +52,18 @@ class Card:
     suspend: bool = False
     front: str = ""
     back: str = ""
-    source_file: str = ""
+    source_file: str = ""  # 原始md文件名，自动填入source字段
+
+    @property
+    def model_name(self) -> str:
+        if self.card_type == "basic":
+            return "Basic-md2anki"
+        return "Cloze-md2anki"
+
+
+def strip_comments(text: str) -> str:
+    """移除 %% ... %% 注释块，跨行支持"""
+    return COMMENT_BLOCK_PATTERN.sub("", text)
 
 
 def anki_invoke(action: str, params: Optional[dict] = None):
@@ -72,18 +85,15 @@ def escape_anki(s: str) -> str:
 def parse_deck_line(line: str) -> Tuple[Optional[str], bool]:
     """
     解析 #toanki/xxx/yyy [@suspend]
-    返回 (deck_name: Optional[str], suspend_flag: bool)
-    deck_name 为 None 代表格式非法
+    返回 (deck_name:Optional[str], suspend_flag:bool)
+    deck_name为None代表格式非法
     """
-    stripped = line.strip()
-    m = DECK_HEAD_PATTERN.match(stripped)
+    m = DECK_HEAD_PATTERN.match(line.strip())
     if not m:
         return None, False
     path_raw = m.group(1).strip()
-    has_suspend = bool(re.search(r"(?:^|\s)@suspend\s*$", stripped))
+    has_suspend = bool(m.group(2))
     parts = [p.strip() for p in path_raw.split("/") if p.strip()]
-    if not parts:
-        return None, False
     deck_name = "::".join(parts)
     return deck_name, has_suspend
 
@@ -358,8 +368,12 @@ def parse_plain_block(
     suspend_flag: bool,
     source_file: str = "",
     trailing_back_items: Optional[List[str]] = None,
-) -> Optional[Card]:
-    """解析裸 ``` 块，块头部：Tags:/uuid: ；@suspend 放在块外 #toanki 行"""
+) -> Tuple[Optional[Card], Optional[str]]:
+    """
+    解析裸 ``` 块，块头部：Tags:/uuid: ；@suspend移到块外#toanki行
+    使用独占一行的 --- 分隔正反面
+    返回：(Card 或 None, 失败原因或 None)
+    """
     lines = block_content.splitlines()
     in_header = True
     tags_raw: Optional[str] = None
@@ -368,6 +382,8 @@ def parse_plain_block(
     for line in lines:
         stripped = line.strip()
         if in_header:
+            low = stripped.lower()
+            # 块内部不再识别 @suspend
             if stripped.startswith("Tags:"):
                 tags_raw = stripped.removeprefix("Tags:").strip()
                 continue
@@ -377,44 +393,63 @@ def parse_plain_block(
             in_header = False
         body_lines.append(line)
     if not uuid:
-        return None
-
+        return None, "缺少 uuid"
+    deck_name = deck_anki
     tag_list = parse_tags(tags_raw)
     body_text = "\n".join(body_lines)
-    if "---" in body_text:
-        front_raw, extra_raw = body_text.split("---", 1)
-        front_text = front_raw.strip()
-        extra_text = extra_raw.strip()
+    # 移除 %%注释
+    body_text = strip_comments(body_text)
+
+    sep_match = CARD_SEP_PATTERN.search(body_text)
+    if sep_match:
+        front_raw = body_text[: sep_match.start()]
+        extra_raw = body_text[sep_match.end() :]
+        has_sep = True
     else:
-        front_text = body_text.strip()
-        extra_text = ""
+        front_raw = body_text
+        extra_raw = ""
+        has_sep = False
+
+    front_text = front_raw.strip()
+    extra_text = extra_raw.strip()
     if not front_text:
-        return None
+        return None, "正面内容为空"
 
     combined_back = append_to_back(extra_text, trailing_back_items or [])
     cloze_text = to_cloze_text(front_text)
     if cloze_text is not None:
-        return Card(
+        return (
+            Card(
+                uuid=uuid,
+                card_type="cloze",
+                deck=deck_name,
+                tags=tag_list,
+                suspend=suspend_flag,
+                front=cloze_text,
+                back=combined_back,
+                source_file=source_file,
+            ),
+            None,
+        )
+
+    if not has_sep:
+        return None, "Basic 缺少独占一行的 --- 分隔符"
+
+    if not combined_back.strip():
+        return None, "Basic 缺少背面内容"
+
+    return (
+        Card(
             uuid=uuid,
-            card_type="cloze",
-            deck=deck_anki,
+            card_type="basic",
+            deck=deck_name,
             tags=tag_list,
             suspend=suspend_flag,
-            front=cloze_text,
+            front=front_text,
             back=combined_back,
             source_file=source_file,
-        )
-    if not combined_back.strip():
-        return None
-    return Card(
-        uuid=uuid,
-        card_type="basic",
-        deck=deck_anki,
-        tags=tag_list,
-        suspend=suspend_flag,
-        front=front_text,
-        back=combined_back,
-        source_file=source_file,
+        ),
+        None,
     )
 
 
@@ -429,11 +464,10 @@ def parse_anki_markdown(
     cards: List[Card] = []
     consumed_line_indices: Set[int] = set()
     lines = md_text.splitlines()
-
     i = 0
     block_idx = 0
     while i < len(lines):
-        line1 = lines[i].strip()
+        line1 = lines[i].strip() if i < len(lines) else ""
         deck_name, suspend_flag = parse_deck_line(line1)
         if deck_name is not None and (i + 1) < len(lines) and re.match(r"^\s*```\s*$", lines[i + 1]):
             start_idx = i + 1
@@ -449,7 +483,6 @@ def parse_anki_markdown(
                 block_idx += 1
                 i += 1
                 continue
-
             raw_block = "\n".join(lines[start_idx + 1 : j])
             uuid_preview = "unknown"
             for bline in raw_block.splitlines():
@@ -457,7 +490,6 @@ def parse_anki_markdown(
                 if s.startswith("uuid:"):
                     uuid_preview = s.removeprefix("uuid:").strip()
                     break
-
             trailing_imgs, after_img_idx = extract_trailing_images_after_block(
                 lines=lines,
                 start_line_idx=j + 1,
@@ -465,7 +497,7 @@ def parse_anki_markdown(
                 uuid=uuid_preview,
                 quiet=quiet,
             )
-            card = parse_plain_block(
+            card, err_reason = parse_plain_block(
                 raw_block,
                 deck_anki=deck_name,
                 suspend_flag=suspend_flag,
@@ -473,7 +505,7 @@ def parse_anki_markdown(
                 trailing_back_items=trailing_imgs,
             )
             if card is None:
-                print(f"⚠️ [{source_file}] 区块 {block_idx}: 解析失败，跳过")
+                print(f"⚠️ [{source_file}] 区块 {block_idx} (uuid={uuid_preview}): 解析失败（{err_reason}），跳过")
             else:
                 card.tags = list(dict.fromkeys(card.tags + extra_default_tags))
                 cards.append(card)
@@ -481,8 +513,7 @@ def parse_anki_markdown(
                     consumed_line_indices.add(k)
                 if not quiet:
                     print(
-                        f"✅ [{source_file}] 裸块解析成功 uuid={card.uuid}, "
-                        f"type={card.card_type}, suspend={card.suspend}, 紧跟图片={len(trailing_imgs)}张"
+                        f"✅ [{source_file}] 裸块解析成功 uuid={card.uuid}, type={card.card_type}, suspend={card.suspend}, 紧跟图片={len(trailing_imgs)}张"
                     )
             block_idx += 1
             i = after_img_idx
@@ -505,7 +536,6 @@ def parse_anki_markdown(
         if not attr_match:
             i += 1
             continue
-
         prop_dict: Dict[str, object] = {}
         for part in attr_match.group(1).split(";"):
             part = part.strip()
@@ -516,32 +546,28 @@ def parse_anki_markdown(
                 prop_dict[k.strip()] = v.strip()
             else:
                 prop_dict[part.strip()] = True
-
         uuid_val = str(prop_dict.get("uuid", "")).strip()
         if not uuid_val:
-            print(f"⚠️ [{source_file}] 简易行缺少 uuid：{line}")
+            print(f"⚠️ [{source_file}] 简易行解析失败（缺少 uuid）：{line}")
             i += 1
             continue
-
         need_suspend = "suspend" in prop_dict
         tag_list = parse_tags(str(prop_dict["tags"])) if "tags" in prop_dict else []
-
-        deck_match = INLINE_DECK_PATTERN.search(line)
+        deck_match = re.search(r"#toanki/[\w\-/]+", line)
         if not deck_match:
-            print(f"⚠️ [{source_file}] 简易行缺少必须的 #toanki/ 卡组标记：{line}")
+            print(f"⚠️ [{source_file}] 简易行 (uuid={uuid_val}) 解析失败（缺少必须的 #toanki/ 卡组标记）：{line}")
             i += 1
             continue
-
         deck_str = deck_match.group(0)
         deck_name, _ = parse_deck_line(deck_str)
         if deck_name is None:
-            print(f"⚠️ [{source_file}] 简易行卡组格式非法，必须 #toanki/ 开头：{line}")
+            print(f"⚠️ [{source_file}] 简易行 (uuid={uuid_val}) 解析失败（卡组格式非法，必须 #toanki/ 开头）：{line}")
             i += 1
             continue
-
         main_text = re.sub(r"<!--\s*uuid\s*:.+?\s*-->", "", line)
-        main_text = INLINE_DECK_PATTERN.sub("", main_text)
+        main_text = re.sub(r"#toanki/[\w\-/]+", "", main_text)
         main_text = main_text.removeprefix("- ").strip()
+        main_text = strip_comments(main_text)
 
         extra_lines: List[str] = []
         j = i + 1
@@ -550,18 +576,23 @@ def parse_anki_markdown(
                 break
             subline = lines[j]
             if re.match(r"^\s+- ", subline):
-                extra_lines.append(re.sub(r"^\s*-\s*", "", subline).strip())
+                s = re.sub(r"^\s*-\s*", "", subline).strip()
+                s = strip_comments(s)
+                extra_lines.append(s)
                 j += 1
             else:
                 break
         extra = "\n".join(extra_lines)
         merged_tags = list(dict.fromkeys(tag_list + extra_default_tags))
-
         if "::" in main_text:
             front, back = main_text.split("::", 1)
             front, back = front.strip(), back.strip()
-            if not front or not back:
-                print(f"⚠️ [{source_file}] 简易 Basic 正反面为空：{line}")
+            if not front:
+                print(f"⚠️ [{source_file}] 简易 Basic (uuid={uuid_val}) 解析失败（正面为空）：{line}")
+                i = j
+                continue
+            if not back:
+                print(f"⚠️ [{source_file}] 简易 Basic (uuid={uuid_val}) 解析失败（背面为空）：{line}")
                 i = j
                 continue
             cards.append(
@@ -579,9 +610,13 @@ def parse_anki_markdown(
             if not quiet:
                 print(f"✅ [{source_file}] 简易Basic解析成功 uuid={uuid_val}, suspend={need_suspend}")
         else:
+            if not main_text:
+                print(f"⚠️ [{source_file}] 简易 Cloze (uuid={uuid_val}) 解析失败（挖空内容为空）：{line}")
+                i = j
+                continue
             cloze_text = to_cloze_text(main_text)
             if cloze_text is None:
-                print(f"⚠️ [{source_file}] 简易 Cloze 无 {{{{}}}} 挖空标记：{line}")
+                print(f"⚠️ [{source_file}] 简易 Cloze (uuid={uuid_val}) 解析失败（缺少 {{{{}}}} 挖空标记）：{line}")
                 i = j
                 continue
             cards.append(
@@ -599,7 +634,6 @@ def parse_anki_markdown(
             if not quiet:
                 print(f"✅ [{source_file}] 简易Cloze解析成功 uuid={uuid_val}, suspend={need_suspend}")
         i = j
-
     return cards
 
 
@@ -628,7 +662,7 @@ def export_tsv(cards: List[Card], out_path: Path):
             tag_str = ",".join(c.tags)
             front_clean = c.front.replace("\t", " ").replace("\r\n", "<br>").replace("\n", "<br>")
             back_clean = c.back.replace("\t", " ").replace("\r\n", "<br>").replace("\n", "<br>")
-            f.write(f"{c.uuid}\t{front_clean}\t{back_clean}\t{c.deck}\t{tag_str}\t{c.suspend}\n")
+            f.write(f"{c.uuid}\t{front_clean}\t{back_clean}\t{c.deck}\t{tag_str}\t{c.suspend}\t{c.source_file}\n")
 
 
 def fetch_existing_uuid_notes() -> Dict[str, dict]:
@@ -638,10 +672,56 @@ def fetch_existing_uuid_notes() -> Dict[str, dict]:
     infos = anki_invoke("notesInfo", {"notes": nids})
     mapping: Dict[str, dict] = {}
     for info in infos:
-        uid = info.get("fields", {}).get("uuid", {}).get("value", "").strip()
-        if uid:
-            mapping[uid] = info
+        aid = info.get("fields", {}).get("uuid", {}).get("value", "").strip()
+        if aid:
+            mapping[aid] = info
     return mapping
+
+
+def diff_cards(local_cards: List[Card], existing_map: Dict[str, dict], quiet: bool):
+    """diff模式，输出新增、更新、待删除，不做修改"""
+    local_dict: Dict[str, Card] = {c.uuid: c for c in local_cards}
+    local_uuids = set(local_dict.keys())
+    remote_uuids = set(existing_map.keys())
+
+    add_list: List[Card] = []
+    update_list: List[Tuple[Card, dict]] = []
+    delete_uuids = remote_uuids - local_uuids
+
+    for c in local_cards:
+        old_note = existing_map.get(c.uuid)
+        if old_note is None:
+            add_list.append(c)
+        else:
+            old_model = old_note.get("modelName", "")
+            if old_model != c.model_name:
+                if not quiet:
+                    print(f"⚠️ DIFF[{c.uuid}] 模型变更：旧={old_model}，新={c.model_name} → 将跳过该卡片同步")
+                continue
+            update_list.append((c, old_note))
+
+    print("\n========== 📊 DIFF 差异预览 ==========")
+    print(f"🟢 新增卡片({len(add_list)}):")
+    for item in add_list:
+        print(f"  - uuid={item.uuid} model={item.model_name} deck={item.deck} src={item.source_file}")
+
+    print(f"\n🟡 更新卡片({len(update_list)}):")
+    for c, _ in update_list:
+        print(f"  - uuid={c.uuid} model={c.model_name} deck={c.deck} src={c.source_file}")
+
+    print(f"\n🔴 Markdown不存在，待删除卡片({len(delete_uuids)}):")
+    for uid in sorted(delete_uuids)[:20]:
+        info = existing_map[uid]
+        preview = (
+            info.get("fields", {}).get("front", {}).get("value")
+            or info.get("fields", {}).get("text", {}).get("value")
+            or ""
+        ).replace("\n", " ")[:50]
+        print(f"  - uuid={uid} preview={preview}")
+    if len(delete_uuids) > 20:
+        print(f"  ...共{len(delete_uuids)}条")
+    print("======================================")
+    print("💡提示：diff仅预览；执行真实同步请去掉--diff参数，搭配--toanki/--allow-delete")
 
 
 def confirm_deletion(
@@ -658,14 +738,14 @@ def confirm_deletion(
         )
         return False
     print(f"\n⚠️ 即将删除 {count} 条 Anki 笔记：")
-    for uid, info in del_items[:15]:
+    for aid, info in del_items[:15]:
         fields = info.get("fields", {})
         preview_val = (
             fields.get("front", {}).get("value")
             or fields.get("text", {}).get("value")
             or ""
         ).replace("\n", " ")[:40]
-        print(f"  - uuid={uid} (nid={info.get('noteId')}): {preview_val}")
+        print(f"  - uuid={aid} (nid={info.get('noteId')}): {preview_val}")
     if count > 15:
         print(f"  ... 还有 {count - 15} 条")
     if candidate_decks:
@@ -673,13 +753,13 @@ def confirm_deletion(
     backup_name = f"anki_delete_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     backup_payload = [
         {
-            "uuid": uid,
+            "uuid": aid,
             "noteId": info.get("noteId"),
             "modelName": info.get("modelName"),
             "tags": info.get("tags"),
             "fields": {k: v.get("value", "") for k, v in info.get("fields", {}).items()},
         }
-        for uid, info in del_items
+        for aid, info in del_items
     ]
     Path(backup_name).write_text(json.dumps(backup_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"💾 已保存待删笔记备份至: {backup_name}")
@@ -691,6 +771,7 @@ def confirm_deletion(
 
 def push_to_anki(
     cards: List[Card],
+    existing_map: Dict[str, dict],
     note_folder: Path,
     toanki: bool = False,
     allow_delete: bool = False,
@@ -728,9 +809,7 @@ def push_to_anki(
         for c in cards:
             print(c)
         return
-
     print("===== 🚀 正式推送模式 =====")
-    existing_map = fetch_existing_uuid_notes()
     local_uuid_set = {c.uuid for c in cards}
     deck_list: List[str] = anki_invoke("deckNames")
     empty_deck_candidates: Set[str] = set()
@@ -747,14 +826,33 @@ def push_to_anki(
                 anki_invoke("createDeck", {"deck": card.deck})
                 deck_list.append(card.deck)
 
-            if card.card_type == "basic":
-                fields = {"front": card.front, "back": card.back, "uuid": card.uuid}
-                model_name = "Basic-md2anki"
-            else:
-                fields = {"text": card.front, "extra": card.back, "uuid": card.uuid}
-                model_name = "Cloze-md2anki"
-
             existing = existing_map.get(card.uuid)
+            # =========模型变更检测============
+            if existing is not None:
+                old_model = existing.get("modelName", "")
+                if old_model != card.model_name:
+                    print(f"⚠️ [uuid={card.uuid}] 跳过同步！笔记模型发生变化：旧模型={old_model}，新模型={card.model_name}")
+                    print("💡提示：AnkiConnect不支持变更笔记模型，请手动删除Anki内旧笔记后再重新同步。")
+                    continue
+            # =================================
+
+            if card.card_type == "basic":
+                fields = {
+                    "front": card.front,
+                    "back": card.back,
+                    "uuid": card.uuid,
+                    "source": card.source_file,
+                }
+                model_name = card.model_name
+            else:
+                fields = {
+                    "text": card.front,
+                    "extra": card.back,
+                    "uuid": card.uuid,
+                    "source": card.source_file,
+                }
+                model_name = card.model_name
+
             if existing is not None:
                 note_id = existing["noteId"]
                 anki_invoke("updateNoteFields", {"note": {"id": note_id, "fields": fields}})
@@ -785,7 +883,6 @@ def push_to_anki(
                 )
                 card_ids = anki_invoke("findCards", {"query": f"nid:{note_id}"})
                 print(f"➕ 新增笔记 uuid={card.uuid}, note_id={note_id}, card_ids={card_ids}")
-
             if card_ids:
                 if card.suspend:
                     to_suspend_cids.extend(card_ids)
@@ -793,7 +890,6 @@ def push_to_anki(
                     to_unsuspend_cids.extend(card_ids)
         except Exception as e:
             print(f"❌ 处理卡片异常 [uuid={card.uuid}]: {e}")
-
     if to_suspend_cids:
         anki_invoke("suspend", {"cards": list(dict.fromkeys(to_suspend_cids))})
         if not quiet:
@@ -802,11 +898,10 @@ def push_to_anki(
         anki_invoke("unsuspend", {"cards": list(dict.fromkeys(to_unsuspend_cids))})
         if not quiet:
             print(f"▶️ 批量恢复卡片数量={len(set(to_unsuspend_cids))}")
-
     if allow_delete:
         try:
             del_items: List[Tuple[str, dict]] = [
-                (uid, info) for uid, info in existing_map.items() if uid not in local_uuid_set
+                (aid, info) for aid, info in existing_map.items() if aid not in local_uuid_set
             ]
             cards_of_deleted: List[int] = []
             for _, info in del_items:
@@ -816,7 +911,6 @@ def push_to_anki(
                 deck_map = anki_invoke("getDecks", {"cards": cards_of_deleted})
                 deleted_note_decks.update(deck_map.keys())
             all_candidate_decks = (deleted_note_decks | empty_deck_candidates) - {"Default"}
-
             if del_items:
                 if not confirm_deletion(del_items, all_candidate_decks, yes=yes, max_delete=max_delete):
                     print("🚫 已取消笔记与空卡组删除。")
@@ -826,11 +920,9 @@ def push_to_anki(
                 print(f"🗑️ 删除 {len(to_del_nids)} 条笔记（Markdown 中已不存在）")
             else:
                 print("✅ 没有需要删除的笔记")
-
             if not all_candidate_decks:
                 print("ℹ️ 本次无空卡组待清理")
                 return
-
             deck_to_delete: List[str] = []
             parent_empty_warn: Set[str] = set()
             for dk in all_candidate_decks:
@@ -839,14 +931,12 @@ def push_to_anki(
                 for p in get_parent_deck_chain(dk):
                     if p != "Default" and is_deck_empty(p):
                         parent_empty_warn.add(p)
-
             if deck_to_delete:
                 deck_to_delete_sorted = sorted(deck_to_delete, key=lambda x: x.count("::"), reverse=True)
                 anki_invoke("deleteDecks", {"decks": deck_to_delete_sorted, "cardsToo": True})
                 print(f"🧹 清理空卡组: {deck_to_delete_sorted}")
             else:
                 print("✅ 没有空卡组需要删除")
-
             if parent_empty_warn:
                 print(f"⚠️ 检测到父卡组为空（不会自动删除）: {sorted(parent_empty_warn)}")
         except Exception as e:
@@ -854,11 +944,10 @@ def push_to_anki(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Markdown同步Anki脚本，裸```块 + 简易短横线格式，卡组#toanki/，@suspend写在卡组行末尾"
-    )
+    parser = argparse.ArgumentParser(description="Markdown同步Anki脚本，裸```块 + 简易短横线格式，卡组#toanki/，@suspend写在卡组行末尾")
     parser.add_argument("dir", nargs="?", default="./notes", help="笔记目录")
     parser.add_argument("--toanki", action="store_true", help="写入Anki；不加则预览")
+    parser.add_argument("--diff", action="store_true", help="差异预览模式：显示新增/更新/待删，不改动Anki")
     parser.add_argument("--allow-delete", action="store_true", help="删除md不存在笔记，清理空卡组")
     parser.add_argument("--yes", "-y", action="store_true", help="删除时跳过交互确认")
     parser.add_argument("--max-delete", type=int, default=20, help="单次允许删除的最大笔记数（0表示不限制）")
@@ -871,30 +960,36 @@ def main():
         help="可选：将解码后的图片文件额外保存到指定本地目录（默认不额外落盘）",
     )
     args = parser.parse_args()
-
     note_folder = Path(args.dir)
     if not note_folder.exists():
         print(f"❌ 目录不存在：{note_folder.resolve()}")
         sys.exit(1)
-
     local_save_dir = Path(args.media_out_dir) if args.media_out_dir.strip() else None
     append_tags = parse_tags(args.append_tags)
     result_cards = scan_md_files(note_folder, quiet=args.quiet, append_tags=append_tags)
-
     seen: Set[str] = set()
     dup_set: Set[str] = set()
     for c in result_cards:
         if c.uuid in seen:
             dup_set.add(c.uuid)
         seen.add(c.uuid)
-
     if dup_set:
         print(f"\n❌ 错误：检测到重复uuid！{sorted(dup_set)}")
         print("❌ 终止运行，不会推送、删除、导出")
         sys.exit(1)
 
+    existing_map: Dict[str, dict] = {}
+    if args.diff or args.toanki:
+        existing_map = fetch_existing_uuid_notes()
+
+    if args.diff:
+        diff_cards(result_cards, existing_map, args.quiet)
+        export_tsv(result_cards, Path(args.tsv))
+        sys.exit(0)
+
     push_to_anki(
         result_cards,
+        existing_map=existing_map,
         note_folder=note_folder,
         toanki=args.toanki,
         allow_delete=args.allow_delete,

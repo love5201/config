@@ -13,6 +13,8 @@ import requests
 
 ANKI_CONNECT_URL = "http://localhost:8765"
 CLOZE_PATTERN = re.compile(r"\{\{\s*(.+?)\s*\}\}")
+# 匹配 %% 注释 %% 跨行，非贪婪
+COMMENT_BLOCK_PATTERN = re.compile(r"%%.*?%%", re.DOTALL)
 # 匹配 #toanki/xxx/yyy  [可选 @suspend]
 DECK_HEAD_PATTERN = re.compile(r"^#toanki/(.*?)(\s+@suspend)?\s*$")
 MD_IMAGE_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
@@ -48,7 +50,16 @@ class Card:
     suspend: bool = False
     front: str = ""
     back: str = ""
-    source_file: str = ""
+    source_file: str = ""  # 原始md文件名，自动填入source字段
+    @property
+    def model_name(self) -> str:
+        if self.card_type == "basic":
+            return "Basic-md2anki"
+        return "Cloze-md2anki"
+
+def strip_comments(text: str) -> str:
+    """移除 %% ... %% 注释块，跨行支持"""
+    return COMMENT_BLOCK_PATTERN.sub("", text)
 
 
 def anki_invoke(action: str, params: Optional[dict] = None):
@@ -370,6 +381,8 @@ def parse_plain_block(
     deck_name = deck_anki
     tag_list = parse_tags(tags_raw)
     body_text = "\n".join(body_lines)
+    # 移除 %%注释
+    body_text = strip_comments(body_text)
     if "---" in body_text:
         front_raw, extra_raw = body_text.split("---", 1)
         front_text = front_raw.strip()
@@ -518,6 +531,7 @@ def parse_anki_markdown(
         main_text = re.sub(r"<!--\s*uuid\s*:.+?\s*-->", "", line)
         main_text = re.sub(r"#toanki/[\w\-/]+", "", main_text)
         main_text = main_text.removeprefix("- ").strip()
+        main_text = strip_comments(main_text)
 
         extra_lines: List[str] = []
         j = i+1
@@ -526,7 +540,9 @@ def parse_anki_markdown(
                 break
             subline = lines[j]
             if re.match(r"^\s+- ", subline):
-                extra_lines.append(re.sub(r"^\s*-\s*", "", subline).strip())
+                s = re.sub(r"^\s*-\s*", "", subline).strip()
+                s = strip_comments(s)
+                extra_lines.append(s)
                 j +=1
             else:
                 break
@@ -602,7 +618,7 @@ def export_tsv(cards: List[Card], out_path: Path):
             tag_str = ",".join(c.tags)
             front_clean = c.front.replace("\t", " ").replace("\r\n", "<br>").replace("\n", "<br>")
             back_clean = c.back.replace("\t", " ").replace("\r\n", "<br>").replace("\n", "<br>")
-            f.write(f"{c.uuid}\t{front_clean}\t{back_clean}\t{c.deck}\t{tag_str}\t{c.suspend}\n")
+            f.write(f"{c.uuid}\t{front_clean}\t{back_clean}\t{c.deck}\t{tag_str}\t{c.suspend}\t{c.source_file}\n")
 
 
 def fetch_existing_uuid_notes() -> Dict[str, dict]:
@@ -616,6 +632,48 @@ def fetch_existing_uuid_notes() -> Dict[str, dict]:
         if aid:
             mapping[aid] = info
     return mapping
+
+
+def diff_cards(local_cards: List[Card], existing_map: Dict[str, dict], quiet: bool):
+    """diff模式，输出新增、更新、待删除，不做修改"""
+    local_dict: Dict[str, Card] = {c.uuid: c for c in local_cards}
+    local_uuids = set(local_dict.keys())
+    remote_uuids = set(existing_map.keys())
+
+    add_list: List[Card] = []
+    update_list: List[Tuple[Card, dict]] = []
+    delete_uuids = remote_uuids - local_uuids
+
+    for c in local_cards:
+        old_note = existing_map.get(c.uuid)
+        if old_note is None:
+            add_list.append(c)
+        else:
+            old_model = old_note.get("modelName","")
+            if old_model != c.model_name:
+                if not quiet:
+                    print(f"⚠️ DIFF[{c.uuid}] 模型变更：旧={old_model}，新={c.model_name} → 将跳过该卡片同步")
+                continue
+            update_list.append((c, old_note))
+
+    print("\n========== 📊 DIFF 差异预览 ==========")
+    print(f"🟢 新增卡片({len(add_list)}):")
+    for item in add_list:
+        print(f"  - uuid={item.uuid} model={item.model_name} deck={item.deck} src={item.source_file}")
+
+    print(f"\n🟡 更新卡片({len(update_list)}):")
+    for c,_ in update_list:
+        print(f"  - uuid={c.uuid} model={c.model_name} deck={c.deck} src={c.source_file}")
+
+    print(f"\n🔴 Markdown不存在，待删除卡片({len(delete_uuids)}):")
+    for uid in sorted(delete_uuids)[:20]:
+        info = existing_map[uid]
+        preview = (info.get("fields",{}).get("front",{}).get("value") or info.get("fields",{}).get("text",{}).get("value") or "").replace("\n"," ")[:50]
+        print(f"  - uuid={uid} preview={preview}")
+    if len(delete_uuids) >20:
+        print(f"  ...共{len(delete_uuids)}条")
+    print("======================================")
+    print("💡提示：diff仅预览；执行真实同步请去掉--diff参数，搭配--toanki/--allow-delete")
 
 
 def confirm_deletion(
@@ -665,6 +723,7 @@ def confirm_deletion(
 
 def push_to_anki(
     cards: List[Card],
+    existing_map: Dict[str, dict],
     note_folder: Path,
     toanki: bool = False,
     allow_delete: bool = False,
@@ -703,12 +762,12 @@ def push_to_anki(
             print(c)
         return
     print("===== 🚀 正式推送模式 =====")
-    existing_map = fetch_existing_uuid_notes()
     local_uuid_set = {c.uuid for c in cards}
     deck_list: List[str] = anki_invoke("deckNames")
     empty_deck_candidates: Set[str] = set()
     to_suspend_cids: List[int] = []
     to_unsuspend_cids: List[int] = []
+
     for card in cards:
         try:
             if not quiet:
@@ -718,13 +777,34 @@ def push_to_anki(
                     print(f"📂 卡组不存在，自动创建: {card.deck}")
                 anki_invoke("createDeck", {"deck": card.deck})
                 deck_list.append(card.deck)
-            if card.card_type == "basic":
-                fields = {"front": card.front, "back": card.back, "uuid": card.uuid}
-                model_name = "Basic-md2anki"
-            else:
-                fields = {"text": card.front, "extra": card.back, "uuid": card.uuid}
-                model_name = "Cloze-md2anki"
+
             existing = existing_map.get(card.uuid)
+            # =========模型变更检测============
+            if existing is not None:
+                old_model = existing.get("modelName","")
+                if old_model != card.model_name:
+                    print(f"⚠️ [uuid={card.uuid}] 跳过同步！笔记模型发生变化：旧模型={old_model}，新模型={card.model_name}")
+                    print("💡提示：AnkiConnect不支持变更笔记模型，请手动删除Anki内旧笔记后再重新同步。")
+                    continue
+            # =================================
+
+            if card.card_type == "basic":
+                fields = {
+                    "front": card.front,
+                    "back": card.back,
+                    "uuid": card.uuid,
+                    "source": card.source_file
+                }
+                model_name = card.model_name
+            else:
+                fields = {
+                    "text": card.front,
+                    "extra": card.back,
+                    "uuid": card.uuid,
+                    "source": card.source_file
+                }
+                model_name = card.model_name
+
             if existing is not None:
                 note_id = existing["noteId"]
                 anki_invoke("updateNoteFields", {"note": {"id": note_id, "fields": fields}})
@@ -819,6 +899,7 @@ def main():
     parser = argparse.ArgumentParser(description="Markdown同步Anki脚本，裸```块 + 简易短横线格式，卡组#toanki/，@suspend写在卡组行末尾")
     parser.add_argument("dir", nargs="?", default="./notes", help="笔记目录")
     parser.add_argument("--toanki", action="store_true", help="写入Anki；不加则预览")
+    parser.add_argument("--diff", action="store_true", help="差异预览模式：显示新增/更新/待删，不改动Anki")
     parser.add_argument("--allow-delete", action="store_true", help="删除md不存在笔记，清理空卡组")
     parser.add_argument("--yes", "-y", action="store_true", help="删除时跳过交互确认")
     parser.add_argument("--max-delete", type=int, default=20, help="单次允许删除的最大笔记数（0表示不限制）")
@@ -848,8 +929,16 @@ def main():
         print(f"\n❌ 错误：检测到重复uuid！{sorted(dup_set)}")
         print("❌ 终止运行，不会推送、删除、导出")
         sys.exit(1)
+
+    existing_map = fetch_existing_uuid_notes()
+    if args.diff:
+        diff_cards(result_cards, existing_map, args.quiet)
+        export_tsv(result_cards, Path(args.tsv))
+        sys.exit(0)
+
     push_to_anki(
         result_cards,
+        existing_map=existing_map,
         note_folder=note_folder,
         toanki=args.toanki,
         allow_delete=args.allow_delete,

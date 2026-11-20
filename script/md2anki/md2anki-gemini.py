@@ -1,14 +1,20 @@
 import re
 import sys
+import json
+import base64
+import hashlib
 import argparse
+from datetime import datetime
+from urllib.parse import unquote
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 import requests
 
 ANKI_CONNECT_URL = "http://localhost:8765"
 CLOZE_PATTERN = re.compile(r"\{\{\s*(.+?)\s*\}\}")
 DECK_TAG_PATTERN = re.compile(r"#(?:ankid(?:::|/))?([\w\-/\\]+)")
+MD_IMAGE_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
 
 
 @dataclass
@@ -20,6 +26,7 @@ class Card:
     suspend: bool = False
     front: str = ""
     back: str = ""
+    source_file: str = ""
 
 
 def anki_invoke(action: str, params: Optional[dict] = None):
@@ -55,7 +62,6 @@ def parse_tags(raw: Optional[str]) -> List[str]:
     if not raw or not raw.strip():
         return []
     parts = re.split(r"[,，\s]+", raw.strip())
-    # Anki 标签不支持空格，替换为下划线并去重保序
     cleaned = [re.sub(r"\s+", "_", p.strip()) for p in parts if p.strip()]
     return list(dict.fromkeys(cleaned))
 
@@ -74,6 +80,71 @@ def to_cloze_text(text: str) -> Optional[str]:
     return CLOZE_PATTERN.sub(repl, text)
 
 
+def store_local_image_to_anki(img_path: Path, media_cache: Dict[Path, str]) -> str:
+    """将本地图片存入 Anki 媒体库，返回 Anki 媒体文件名"""
+    resolved = img_path.resolve()
+    if resolved in media_cache:
+        return media_cache[resolved]
+
+    raw_bytes = resolved.read_bytes()
+    short_hash = hashlib.md5(raw_bytes).hexdigest()[:8]
+    safe_stem = re.sub(r"[^\w\-]", "_", resolved.stem) or "img"
+    suffix = resolved.suffix.lower() or ".png"
+    anki_filename = f"bear_{safe_stem}_{short_hash}{suffix}"
+
+    b64_data = base64.b64encode(raw_bytes).decode("ascii")
+    anki_invoke("storeMediaFile", {"filename": anki_filename, "data": b64_data})
+    media_cache[resolved] = anki_filename
+    return anki_filename
+
+
+def process_images_in_text(
+    text: str,
+    md_file_path: Optional[Path],
+    media_cache: Dict[Path, str],
+    toanki: bool,
+    quiet: bool,
+    ankid: str,
+) -> str:
+    """处理文本中的 Markdown 图片引用，上传本地图片并转换为 <img src="...">"""
+    if not text or "![" not in text:
+        return text
+
+    base_dir = md_file_path.parent if md_file_path else Path(".")
+
+    def repl(match: re.Match) -> str:
+        alt = match.group("alt").strip()
+        raw_src = unquote(match.group("src").strip())
+
+        # 网络链接直接保留
+        if raw_src.startswith(("http://", "https://", "data:")):
+            return match.group(0)
+
+        candidate = Path(raw_src)
+        if not candidate.is_absolute():
+            candidate = base_dir / candidate
+
+        if not candidate.exists() or not candidate.is_file():
+            print(f"⚠️ [ankid={ankid}] 图片文件不存在，跳过上传: {raw_src} (解析路径: {candidate})")
+            return match.group(0)
+
+        if not toanki:
+            # 预览模式下不写 Anki 媒体库，仅提示将处理
+            if not quiet:
+                print(f"🖼️ [预览][ankid={ankid}] 检测到本地图片: {candidate}")
+            return match.group(0)
+
+        try:
+            media_name = store_local_image_to_anki(candidate, media_cache)
+            alt_attr = f' alt="{escape_anki(alt)}"' if alt else ""
+            return f'<img src="{escape_anki(media_name)}"{alt_attr}>'
+        except Exception as e:
+            print(f"❌ [ankid={ankid}] 上传图片失败 {candidate}: {e}")
+            return match.group(0)
+
+    return MD_IMAGE_PATTERN.sub(repl, text)
+
+
 def get_parent_deck_chain(deck_name: str) -> List[str]:
     parts = deck_name.split("::")
     return ["::".join(parts[:i]) for i in range(len(parts) - 1, 0, -1)]
@@ -84,7 +155,7 @@ def is_deck_empty(deck_name: str) -> bool:
     return len(cids) == 0
 
 
-def parse_anki_block(block_content: str) -> Optional[Card]:
+def parse_anki_block(block_content: str, source_file: str = "") -> Optional[Card]:
     lines = block_content.splitlines()
     in_header = True
     suspend = False
@@ -140,6 +211,7 @@ def parse_anki_block(block_content: str) -> Optional[Card]:
             suspend=suspend,
             front=cloze_text,
             back=extra_text,
+            source_file=source_file,
         )
 
     if not extra_text:
@@ -153,6 +225,7 @@ def parse_anki_block(block_content: str) -> Optional[Card]:
         suspend=suspend,
         front=front_text,
         back=extra_text,
+        source_file=source_file,
     )
 
 
@@ -165,14 +238,16 @@ def parse_anki_markdown(
     extra_default_tags = parse_tags(",".join(append_tags)) if append_tags else ["bear-app"]
     cards: List[Card] = []
 
-    # 1. 解析 ```anki 代码块
-    block_pattern = re.compile(r"```anki[ \t]*\r?\n(?P<content>.*?)\r?\n```[ \t]*$", re.DOTALL | re.MULTILINE)
+    block_pattern = re.compile(
+        r"```anki[ \t]*\r?\n(?P<content>.*?)\r?\n```[ \t]*$",
+        re.DOTALL | re.MULTILINE,
+    )
     blocks = list(block_pattern.finditer(md_text))
     if not quiet:
         print(f"\n[DEBUG {source_file}] 检测到 ```anki 块数量={len(blocks)}")
 
     for idx, m in enumerate(blocks):
-        card = parse_anki_block(m.group("content"))
+        card = parse_anki_block(m.group("content"), source_file=source_file)
         if card is None:
             print(f"⚠️ [{source_file}] 区块 {idx}: ```anki 解析失败，跳过")
             continue
@@ -181,7 +256,6 @@ def parse_anki_markdown(
         if not quiet:
             print(f"✅ [{source_file}] anki块解析成功 ankid={card.ankid}, type={card.card_type}, suspend={card.suspend}")
 
-    # 2. 解析简易短横线行
     lines = md_text.splitlines()
     i = 0
     while i < len(lines):
@@ -256,6 +330,7 @@ def parse_anki_markdown(
                     suspend=need_suspend,
                     front=front,
                     back=back,
+                    source_file=source_file,
                 )
             )
             if not quiet:
@@ -275,6 +350,7 @@ def parse_anki_markdown(
                     suspend=need_suspend,
                     front=cloze_text,
                     back=extra,
+                    source_file=source_file,
                 )
             )
             if not quiet:
@@ -287,10 +363,12 @@ def parse_anki_markdown(
 
 def scan_md_files(folder: Path, quiet: bool = False, append_tags: Optional[List[str]] = None) -> List[Card]:
     all_cards: List[Card] = []
-    for f in sorted(folder.glob("*.md")):
+    # rglob 兼容 Bear 导出时可能出现的子目录结构
+    for f in sorted(folder.rglob("*.md")):
         try:
             text = f.read_text(encoding="utf-8")
-            cards = parse_anki_markdown(text, source_file=f.name, quiet=quiet, append_tags=append_tags)
+            rel_name = str(f.relative_to(folder))
+            cards = parse_anki_markdown(text, source_file=rel_name, quiet=quiet, append_tags=append_tags)
             all_cards.extend(cards)
         except Exception as e:
             print(f"❌ 读取文件失败 {f}: {e}")
@@ -301,7 +379,6 @@ def export_tsv(cards: List[Card], out_path: Path):
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         for c in cards:
             tag_str = ",".join(c.tags)
-            # 替换换行与制表符，避免破坏 TSV 行列结构
             front_clean = c.front.replace("\t", " ").replace("\r\n", "<br>").replace("\n", "<br>")
             back_clean = c.back.replace("\t", " ").replace("\r\n", "<br>").replace("\n", "<br>")
             f.write(f"{c.ankid}\t{front_clean}\t{back_clean}\t{c.deck}\t{tag_str}\t{c.suspend}\n")
@@ -320,7 +397,75 @@ def fetch_existing_ankid_notes() -> Dict[str, dict]:
     return mapping
 
 
-def push_to_anki(cards: List[Card], toanki: bool = False, allow_delete: bool = False, quiet: bool = False):
+def confirm_deletion(
+    del_items: List[Tuple[str, dict]],
+    candidate_decks: Set[str],
+    yes: bool = False,
+    max_delete: int = 20,
+) -> bool:
+    """防误删确认：阈值检查 + 备份 + 人工确认"""
+    count = len(del_items)
+    if max_delete > 0 and count > max_delete:
+        print(
+            f"🛑 触发防误删保护：待删除笔记数 ({count}) 超过上限 (--max-delete={max_delete})。"
+            f"请核对目录是否正确，或使用 --max-delete 调大阈值。"
+        )
+        return False
+
+    print(f"\n⚠️ 即将删除 {count} 条 Anki 笔记：")
+    for aid, info in del_items[:15]:
+        fields = info.get("fields", {})
+        preview_val = (
+            fields.get("front", {}).get("value")
+            or fields.get("text", {}).get("value")
+            or ""
+        ).replace("\n", " ")[:40]
+        print(f"  - ankid={aid} (nid={info.get('noteId')}): {preview_val}")
+    if count > 15:
+        print(f"  ... 还有 {count - 15} 条")
+
+    if candidate_decks:
+        print(f"⚠️ 关联空卡组候选（若为空将被清理）: {sorted(candidate_decks)}")
+
+    # 写入备份快照
+    backup_name = f"anki_delete_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    backup_payload = [
+        {
+            "ankid": aid,
+            "noteId": info.get("noteId"),
+            "modelName": info.get("modelName"),
+            "tags": info.get("tags"),
+            "fields": {k: v.get("value", "") for k, v in info.get("fields", {}).items()},
+        }
+        for aid, info in del_items
+    ]
+    Path(backup_name).write_text(json.dumps(backup_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"💾 已保存待删笔记备份至: {backup_name}")
+
+    if yes:
+        return True
+
+    ans = input("请输入 DELETE 确认删除（其他输入取消）: ").strip()
+    return ans == "DELETE"
+
+
+def push_to_anki(
+    cards: List[Card],
+    note_folder: Path,
+    toanki: bool = False,
+    allow_delete: bool = False,
+    yes: bool = False,
+    max_delete: int = 20,
+    quiet: bool = False,
+):
+    media_cache: Dict[Path, str] = {}
+
+    # 先处理每张卡片的图片路径
+    for c in cards:
+        md_path = (note_folder / c.source_file) if c.source_file else None
+        c.front = process_images_in_text(c.front, md_path, media_cache, toanki=toanki, quiet=quiet, ankid=c.ankid)
+        c.back = process_images_in_text(c.back, md_path, media_cache, toanki=toanki, quiet=quiet, ankid=c.ankid)
+
     if not toanki:
         print("\n===== 仅预览模式，不写入 Anki =====")
         for c in cards:
@@ -406,25 +551,30 @@ def push_to_anki(cards: List[Card], toanki: bool = False, allow_delete: bool = F
 
     if allow_delete:
         try:
-            to_del_nids: List[int] = []
+            del_items: List[Tuple[str, dict]] = [
+                (aid, info) for aid, info in existing_map.items() if aid not in local_ankid_set
+            ]
             cards_of_deleted: List[int] = []
-            for aid, info in existing_map.items():
-                if aid not in local_ankid_set:
-                    to_del_nids.append(info["noteId"])
-                    cards_of_deleted.extend(info.get("cards", []))
+            for _, info in del_items:
+                cards_of_deleted.extend(info.get("cards", []))
 
             deleted_note_decks: Set[str] = set()
             if cards_of_deleted:
                 deck_map = anki_invoke("getDecks", {"cards": cards_of_deleted})
                 deleted_note_decks.update(deck_map.keys())
 
-            if to_del_nids:
+            all_candidate_decks = (deleted_note_decks | empty_deck_candidates) - {"Default"}
+
+            if del_items:
+                if not confirm_deletion(del_items, all_candidate_decks, yes=yes, max_delete=max_delete):
+                    print("🚫 已取消笔记与空卡组删除。")
+                    return
+                to_del_nids = [info["noteId"] for _, info in del_items]
                 anki_invoke("deleteNotes", {"notes": to_del_nids})
                 print(f"🗑️ 删除 {len(to_del_nids)} 条笔记（Markdown 中已不存在）")
             else:
                 print("✅ 没有需要删除的笔记")
 
-            all_candidate_decks = (deleted_note_decks | empty_deck_candidates) - {"Default"}
             if not all_candidate_decks:
                 print("ℹ️ 本次无空卡组待清理")
                 return
@@ -456,6 +606,8 @@ def main():
     parser.add_argument("dir", nargs="?", default="./notes", help="笔记目录")
     parser.add_argument("--toanki", action="store_true", help="写入Anki；不加则预览")
     parser.add_argument("--allow-delete", action="store_true", help="删除md不存在笔记，清理空卡组")
+    parser.add_argument("--yes", "-y", action="store_true", help="删除时跳过交互确认")
+    parser.add_argument("--max-delete", type=int, default=20, help="单次允许删除的最大笔记数（0表示不限制）")
     parser.add_argument("--quiet", action="store_true", help="安静模式")
     parser.add_argument("--append-tags", default="bear-app", help="追加标签，逗号分隔")
     parser.add_argument("--tsv", default="anki_export.tsv", help="导出 TSV 路径")
@@ -481,7 +633,15 @@ def main():
         print("❌ 终止运行，不会推送、删除、导出")
         sys.exit(1)
 
-    push_to_anki(result_cards, toanki=args.toanki, allow_delete=args.allow_delete, quiet=args.quiet)
+    push_to_anki(
+        result_cards,
+        note_folder=note_folder,
+        toanki=args.toanki,
+        allow_delete=args.allow_delete,
+        yes=args.yes,
+        max_delete=args.max_delete,
+        quiet=args.quiet,
+    )
     export_tsv(result_cards, Path(args.tsv))
 
 

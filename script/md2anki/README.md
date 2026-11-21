@@ -48,9 +48,9 @@ pip install requests
 ```
 #toanki/计算机网络/TCP
 \```
-## uuid: tcp-congestion-001
+uuid: tcp-congestion-001
 Tags: 面试, 拥塞控制
-TCP 拥塞控制的核心阶段有哪些？
+TCP拥塞控制的核心阶段有哪些？
 ---
 1. 慢启动（Slow Start）
 2. 拥塞避免（Congestion Avoidance）
@@ -68,22 +68,14 @@ TCP 拥塞控制的核心阶段有哪些？
 
 * **Basic 单行**（用 `::` 分隔正反面）：
 
-
 ```
 线性回归的损失函数通常使用::均方误差 (MSE) #toanki/机器学习2 <!-- uuid: eee1731945600124;suspend -->
 ```
-
-
 * **Cloze 单行**（含 `{{...}}` 挖空，下方缩进的 `- ` 子行可作为背面补充）：
-
-
 ```
 1. {{TCP}} 是面向连接的可靠传输协议 #toanki/计算机网络/基础 <!-- uuid: net-tcp-002; tags: 网络,基础 -->
   - 常见同类协议为 UDP
 ```
-
-
-
 > **注释属性灵活性**：`<!-- ... -->` 内支持任意空格、全/半角分号（`;` / `；`）与冒号（`:` / `：`）、键名大小写不敏感（如 `uuid`、`tags`、`suspend`）。
 > 
 > 

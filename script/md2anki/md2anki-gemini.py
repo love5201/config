@@ -12,13 +12,24 @@ from typing import Dict, List, Optional, Set, Tuple
 import requests
 
 ANKI_CONNECT_URL = "http://localhost:8765"
+DEFAULT_DATA_DIR = "data"
+DEFAULT_DELETE_BACKUP_SUBDIR = "delete_backup"
+DEFAULT_TSV_NAME = "anki_export.tsv"
 CLOZE_PATTERN = re.compile(r"\{\{\s*(.+?)\s*\}\}")
 # 匹配 %% 注释 %% 跨行，非贪婪
 COMMENT_BLOCK_PATTERN = re.compile(r"%%.*?%%", re.DOTALL)
 # 匹配独占一行的 --- 分隔符
 CARD_SEP_PATTERN = re.compile(r"(?m)^---\s*$")
-# 匹配 #toanki/xxx/yyy  [可选 @suspend]
-DECK_HEAD_PATTERN = re.compile(r"^#toanki/(.*?)(\s+@suspend)?\s*$")
+# 匹配 #toanki/xxx/yyy  [可选 @suspend]，#toanki/ 前允许 0 个或多个空格/Tab
+DECK_HEAD_PATTERN = re.compile(r"^[ \t]*#toanki/(.*?)(\s+@suspend)?\s*$")
+# 匹配单行卡片中的 #toanki/... 卡组标记（#toanki/ 前允许 0 个或多个空格/Tab）
+INLINE_DECK_PATTERN = re.compile(r"[ \t]*#toanki/[^\s<]*")
+# 匹配行首可能存在的脚注 [^1]:、无序列表 - 、有序列表 1.
+LINE_PREFIX_PATTERN = re.compile(r"^\s*(?:\[\^[^\]]+\]:\s*|-\s+|\d+\.\s+)")
+# 匹配单行卡片 HTML 注释元数据 <!-- ... -->
+INLINE_META_PATTERN = re.compile(r"<!--\s*(.*?)\s*-->")
+# 匹配单行卡片紧跟的无序列表补充行：前导0个或多个空格/Tab，- 后必须有1个空格
+INLINE_EXTRA_LINE_PATTERN = re.compile(r"^[ \t]*- ")
 MD_IMAGE_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
 SINGLE_IMAGE_LINE_PATTERN = re.compile(
     r"^\s*!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)\s*(?:<!--.*?-->\s*)?$"
@@ -61,21 +72,77 @@ class Card:
         return "Cloze-md2anki"
 
 
+def resolve_data_file_path(raw_path: str, data_dir: Path, default_name: str) -> Path:
+    """将导出文件路径统一归入 data_dir（若传入含目录的路径则按指定路径处理）"""
+    cleaned = raw_path.strip() if raw_path and raw_path.strip() else default_name
+    p = Path(cleaned)
+    if p.is_absolute() or len(p.parts) > 1:
+        return p
+    return data_dir / p.name
+
+
 def strip_comments(text: str) -> str:
     """移除 %% ... %% 注释块，跨行支持"""
     return COMMENT_BLOCK_PATTERN.sub("", text)
+
+
+def parse_inline_card_meta(raw_meta: str) -> Dict[str, object]:
+    """
+    灵活解析单行注释内的键值属性，支持任意空格与全/半角分隔符：
+    <!-- uuid: eee1731945600124;suspend -->
+    <!--uuid:eee1731945600124; suspend ; tags: a, b-->
+    """
+    prop_dict: Dict[str, object] = {}
+    for part in re.split(r"[;；]+", raw_meta):
+        token = part.strip()
+        if not token:
+            continue
+        kv_match = re.match(r"^([A-Za-z_]+)\s*[:：]\s*(.+?)\s*$", token)
+        if kv_match:
+            key = kv_match.group(1).strip().lower()
+            val = kv_match.group(2).strip()
+            prop_dict[key] = val
+        else:
+            prop_dict[token.lower()] = True
+    return prop_dict
 
 
 def anki_invoke(action: str, params: Optional[dict] = None):
     payload = {"action": action, "version": 6}
     if params is not None:
         payload["params"] = params
-    resp = requests.post(ANKI_CONNECT_URL, json=payload, timeout=15)
-    resp.raise_for_status()
-    ret = resp.json()
+    try:
+        resp = requests.post(ANKI_CONNECT_URL, json=payload, timeout=15)
+        resp.raise_for_status()
+        ret = resp.json()
+    except requests.exceptions.ConnectionError as e:
+        raise RuntimeError(
+            f"无法连接到 AnkiConnect ({ANKI_CONNECT_URL})：请确认 Anki 已启动且已安装并启用 AnkiConnect 插件。"
+        ) from e
+    except requests.exceptions.Timeout as e:
+        raise RuntimeError(
+            f"连接 AnkiConnect ({ANKI_CONNECT_URL}) 超时（action={action}）。"
+        ) from e
+    except Exception as e:
+        raise RuntimeError(f"AnkiConnect [{action}] 请求失败: {e}") from e
     if ret.get("error"):
         raise RuntimeError(f"AnkiConnect [{action}] error: {ret['error']}")
     return ret.get("result")
+
+
+def check_anki_connect() -> bool:
+    """检查 AnkiConnect 是否可用，不可用时打印明确提示并返回 False"""
+    try:
+        ver = anki_invoke("version")
+        print(f"🔌 已连接 AnkiConnect (API v{ver})")
+        return True
+    except RuntimeError as e:
+        print(f"\n❌ {e}")
+        print("💡 排查建议：")
+        print("   1. 确认桌面端 Anki 正在运行（后台托盘中存在 Anki 进程）")
+        print("   2. 确认已安装 AnkiConnect 插件（插件代码: 2055492159），且未被禁用")
+        print(f"   3. 确认本地端口 {ANKI_CONNECT_URL} 未被防火墙或代理拦截")
+        return False
 
 
 def escape_anki(s: str) -> str:
@@ -84,16 +151,18 @@ def escape_anki(s: str) -> str:
 
 def parse_deck_line(line: str) -> Tuple[Optional[str], bool]:
     """
-    解析 #toanki/xxx/yyy [@suspend]
+    解析 [0个或多个空格/Tab]#toanki/xxx/yyy [@suspend]
     返回 (deck_name:Optional[str], suspend_flag:bool)
     deck_name为None代表格式非法
     """
-    m = DECK_HEAD_PATTERN.match(line.strip())
+    m = DECK_HEAD_PATTERN.match(line)
     if not m:
         return None, False
     path_raw = m.group(1).strip()
     has_suspend = bool(m.group(2))
     parts = [p.strip() for p in path_raw.split("/") if p.strip()]
+    if not parts:
+        return None, False
     deck_name = "::".join(parts)
     return deck_name, has_suspend
 
@@ -467,7 +536,7 @@ def parse_anki_markdown(
     i = 0
     block_idx = 0
     while i < len(lines):
-        line1 = lines[i].strip() if i < len(lines) else ""
+        line1 = lines[i] if i < len(lines) else ""
         deck_name, suspend_flag = parse_deck_line(line1)
         if deck_name is not None and (i + 1) < len(lines) and re.match(r"^\s*```\s*$", lines[i + 1]):
             start_idx = i + 1
@@ -529,54 +598,55 @@ def parse_anki_markdown(
             i += 1
             continue
         line = lines[i]
-        if not line.startswith("- "):
+        # 只要同一行存在 #toanki/ 和 <!-- ... -->，即判定为单行卡片
+        if "#toanki/" not in line:
             i += 1
             continue
-        attr_match = re.search(r"<!--\s*(uuid\s*:.+?)\s*-->", line)
+        attr_match = INLINE_META_PATTERN.search(line)
         if not attr_match:
             i += 1
             continue
-        prop_dict: Dict[str, object] = {}
-        for part in attr_match.group(1).split(";"):
-            part = part.strip()
-            if not part:
-                continue
-            if ":" in part:
-                k, v = part.split(":", 1)
-                prop_dict[k.strip()] = v.strip()
-            else:
-                prop_dict[part.strip()] = True
+        prop_dict = parse_inline_card_meta(attr_match.group(1))
         uuid_val = str(prop_dict.get("uuid", "")).strip()
         if not uuid_val:
-            print(f"⚠️ [{source_file}] 简易行解析失败（缺少 uuid）：{line}")
+            print(f"⚠️ [{source_file}] 单行卡片解析失败（缺少 uuid）：{line}")
             i += 1
             continue
-        need_suspend = "suspend" in prop_dict
+        need_suspend = bool(prop_dict.get("suspend", False))
         tag_list = parse_tags(str(prop_dict["tags"])) if "tags" in prop_dict else []
-        deck_match = re.search(r"#toanki/[\w\-/]+", line)
+        deck_match = INLINE_DECK_PATTERN.search(line)
         if not deck_match:
-            print(f"⚠️ [{source_file}] 简易行 (uuid={uuid_val}) 解析失败（缺少必须的 #toanki/ 卡组标记）：{line}")
+            print(f"⚠️ [{source_file}] 单行卡片 (uuid={uuid_val}) 解析失败（缺少必须的 #toanki/ 卡组标记）：{line}")
             i += 1
             continue
-        deck_str = deck_match.group(0)
+        deck_str = deck_match.group(0).strip()
         deck_name, _ = parse_deck_line(deck_str)
-        if deck_name is None:
-            print(f"⚠️ [{source_file}] 简易行 (uuid={uuid_val}) 解析失败（卡组格式非法，必须 #toanki/ 开头）：{line}")
+        if not deck_name:
+            print(f"⚠️ [{source_file}] 单行卡片 (uuid={uuid_val}) 解析失败（卡组名不可为空）：{line}")
             i += 1
             continue
-        main_text = re.sub(r"<!--\s*uuid\s*:.+?\s*-->", "", line)
-        main_text = re.sub(r"#toanki/[\w\-/]+", "", main_text)
-        main_text = main_text.removeprefix("- ").strip()
+
+        main_text = INLINE_META_PATTERN.sub("", line)
+        main_text = INLINE_DECK_PATTERN.sub("", main_text)
+        # 过滤行头可能存在的 [^1]:、无序列表 - 、有序列表 1.
+        main_text = LINE_PREFIX_PATTERN.sub("", main_text).strip()
         main_text = strip_comments(main_text)
 
+        # 收集紧跟在单行卡片下方的补充列表（前导0个或多个空格，- 后必须有1个空格，遇到空行则停止）
         extra_lines: List[str] = []
         j = i + 1
         while j < len(lines):
             if j in consumed_line_indices:
                 break
             subline = lines[j]
-            if re.match(r"^\s+- ", subline):
-                s = re.sub(r"^\s*-\s*", "", subline).strip()
+            # 遇到空行则不属于当前卡片内容
+            if not subline.strip():
+                break
+            # 若该行本身是另一张单行卡片，停止收集
+            if "#toanki/" in subline and INLINE_META_PATTERN.search(subline):
+                break
+            if INLINE_EXTRA_LINE_PATTERN.match(subline):
+                s = INLINE_EXTRA_LINE_PATTERN.sub("", subline, count=1).strip()
                 s = strip_comments(s)
                 extra_lines.append(s)
                 j += 1
@@ -588,11 +658,11 @@ def parse_anki_markdown(
             front, back = main_text.split("::", 1)
             front, back = front.strip(), back.strip()
             if not front:
-                print(f"⚠️ [{source_file}] 简易 Basic (uuid={uuid_val}) 解析失败（正面为空）：{line}")
+                print(f"⚠️ [{source_file}] 单行 Basic (uuid={uuid_val}) 解析失败（正面为空）：{line}")
                 i = j
                 continue
             if not back:
-                print(f"⚠️ [{source_file}] 简易 Basic (uuid={uuid_val}) 解析失败（背面为空）：{line}")
+                print(f"⚠️ [{source_file}] 单行 Basic (uuid={uuid_val}) 解析失败（背面为空）：{line}")
                 i = j
                 continue
             cards.append(
@@ -608,15 +678,15 @@ def parse_anki_markdown(
                 )
             )
             if not quiet:
-                print(f"✅ [{source_file}] 简易Basic解析成功 uuid={uuid_val}, suspend={need_suspend}")
+                print(f"✅ [{source_file}] 单行Basic解析成功 uuid={uuid_val}, suspend={need_suspend}")
         else:
             if not main_text:
-                print(f"⚠️ [{source_file}] 简易 Cloze (uuid={uuid_val}) 解析失败（挖空内容为空）：{line}")
+                print(f"⚠️ [{source_file}] 单行 Cloze (uuid={uuid_val}) 解析失败（挖空内容为空）：{line}")
                 i = j
                 continue
             cloze_text = to_cloze_text(main_text)
             if cloze_text is None:
-                print(f"⚠️ [{source_file}] 简易 Cloze (uuid={uuid_val}) 解析失败（缺少 {{{{}}}} 挖空标记）：{line}")
+                print(f"⚠️ [{source_file}] 单行 Cloze (uuid={uuid_val}) 解析失败（缺少 {{{{}}}} 挖空标记）：{line}")
                 i = j
                 continue
             cards.append(
@@ -632,7 +702,7 @@ def parse_anki_markdown(
                 )
             )
             if not quiet:
-                print(f"✅ [{source_file}] 简易Cloze解析成功 uuid={uuid_val}, suspend={need_suspend}")
+                print(f"✅ [{source_file}] 单行Cloze解析成功 uuid={uuid_val}, suspend={need_suspend}")
         i = j
     return cards
 
@@ -657,6 +727,7 @@ def scan_md_files(folder: Path, quiet: bool = False, append_tags: Optional[List[
 
 
 def export_tsv(cards: List[Card], out_path: Path):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         for c in cards:
             tag_str = ",".join(c.tags)
@@ -727,6 +798,7 @@ def diff_cards(local_cards: List[Card], existing_map: Dict[str, dict], quiet: bo
 def confirm_deletion(
     del_items: List[Tuple[str, dict]],
     candidate_decks: Set[str],
+    backup_dir: Path = Path(DEFAULT_DATA_DIR) / DEFAULT_DELETE_BACKUP_SUBDIR,
     yes: bool = False,
     max_delete: int = 20,
 ) -> bool:
@@ -750,7 +822,8 @@ def confirm_deletion(
         print(f"  ... 还有 {count - 15} 条")
     if candidate_decks:
         print(f"⚠️ 关联空卡组候选（若为空将被清理）: {sorted(candidate_decks)}")
-    backup_name = f"anki_delete_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / f"anki_delete_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     backup_payload = [
         {
             "uuid": aid,
@@ -761,8 +834,8 @@ def confirm_deletion(
         }
         for aid, info in del_items
     ]
-    Path(backup_name).write_text(json.dumps(backup_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"💾 已保存待删笔记备份至: {backup_name}")
+    backup_path.write_text(json.dumps(backup_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"💾 已保存待删笔记备份至: {backup_path}")
     if yes:
         return True
     ans = input("请输入 DELETE 确认删除（其他输入取消）: ").strip()
@@ -773,6 +846,7 @@ def push_to_anki(
     cards: List[Card],
     existing_map: Dict[str, dict],
     note_folder: Path,
+    backup_dir: Path = Path(DEFAULT_DATA_DIR) / DEFAULT_DELETE_BACKUP_SUBDIR,
     toanki: bool = False,
     allow_delete: bool = False,
     yes: bool = False,
@@ -912,7 +986,13 @@ def push_to_anki(
                 deleted_note_decks.update(deck_map.keys())
             all_candidate_decks = (deleted_note_decks | empty_deck_candidates) - {"Default"}
             if del_items:
-                if not confirm_deletion(del_items, all_candidate_decks, yes=yes, max_delete=max_delete):
+                if not confirm_deletion(
+                    del_items,
+                    all_candidate_decks,
+                    backup_dir=backup_dir,
+                    yes=yes,
+                    max_delete=max_delete,
+                ):
                     print("🚫 已取消笔记与空卡组删除。")
                     return
                 to_del_nids = [info["noteId"] for _, info in del_items]
@@ -944,7 +1024,7 @@ def push_to_anki(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Markdown同步Anki脚本，裸```块 + 简易短横线格式，卡组#toanki/，@suspend写在卡组行末尾")
+    parser = argparse.ArgumentParser(description="Markdown同步Anki脚本，裸```块 + 单行格式，卡组#toanki/，@suspend写在卡组行末尾或注释内")
     parser.add_argument("dir", nargs="?", default="./notes", help="笔记目录")
     parser.add_argument("--toanki", action="store_true", help="写入Anki；不加则预览")
     parser.add_argument("--diff", action="store_true", help="差异预览模式：显示新增/更新/待删，不改动Anki")
@@ -953,7 +1033,8 @@ def main():
     parser.add_argument("--max-delete", type=int, default=20, help="单次允许删除的最大笔记数（0表示不限制）")
     parser.add_argument("--quiet", action="store_true", help="安静模式")
     parser.add_argument("--append-tags", default="bear-app", help="追加标签，逗号分隔")
-    parser.add_argument("--tsv", default="anki_export.tsv", help="导出 TSV 路径")
+    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="数据存放目录（默认：data）")
+    parser.add_argument("--tsv", default=DEFAULT_TSV_NAME, help="导出 TSV 文件名或路径（默认存入 data/anki_export.tsv）")
     parser.add_argument(
         "--media-out-dir",
         default="",
@@ -964,6 +1045,9 @@ def main():
     if not note_folder.exists():
         print(f"❌ 目录不存在：{note_folder.resolve()}")
         sys.exit(1)
+    data_dir = Path(args.data_dir)
+    backup_dir = data_dir / DEFAULT_DELETE_BACKUP_SUBDIR
+    tsv_path = resolve_data_file_path(args.tsv, data_dir, DEFAULT_TSV_NAME)
     local_save_dir = Path(args.media_out_dir) if args.media_out_dir.strip() else None
     append_tags = parse_tags(args.append_tags)
     result_cards = scan_md_files(note_folder, quiet=args.quiet, append_tags=append_tags)
@@ -980,17 +1064,24 @@ def main():
 
     existing_map: Dict[str, dict] = {}
     if args.diff or args.toanki:
-        existing_map = fetch_existing_uuid_notes()
+        if not check_anki_connect():
+            sys.exit(1)
+        try:
+            existing_map = fetch_existing_uuid_notes()
+        except RuntimeError as e:
+            print(f"\n❌ {e}")
+            sys.exit(1)
 
     if args.diff:
         diff_cards(result_cards, existing_map, args.quiet)
-        export_tsv(result_cards, Path(args.tsv))
+        export_tsv(result_cards, tsv_path)
         sys.exit(0)
 
     push_to_anki(
         result_cards,
         existing_map=existing_map,
         note_folder=note_folder,
+        backup_dir=backup_dir,
         toanki=args.toanki,
         allow_delete=args.allow_delete,
         yes=args.yes,
@@ -998,7 +1089,7 @@ def main():
         quiet=args.quiet,
         local_save_dir=local_save_dir,
     )
-    export_tsv(result_cards, Path(args.tsv))
+    export_tsv(result_cards, tsv_path)
 
 
 if __name__ == "__main__":

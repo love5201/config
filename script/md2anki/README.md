@@ -47,7 +47,7 @@ pip install requests
 
 ```
 #toanki/计算机网络/TCP
-```
+\```
 ## uuid: tcp-congestion-001
 Tags: 面试, 拥塞控制
 TCP 拥塞控制的核心阶段有哪些？
@@ -56,7 +56,7 @@ TCP 拥塞控制的核心阶段有哪些？
 2. 拥塞避免（Congestion Avoidance）
 3. 快重传与快恢复（Fast Retransmit & Recovery）
 %% 这是块内注释，同步时会自动移除 %%
-```
+\```
 ```
 * **块头部**：支持 `uuid:`（必填）和 `Tags:`（可选，逗号/中文逗号/空格分隔）。
 * **正反面分隔**：使用**独占一行的 `---**` 分隔正面与背面。若正面包含 `{{...}}`，自动识别为 `Cloze-md2anki`；否则为 `Basic-md2anki`（需有背面内容）。

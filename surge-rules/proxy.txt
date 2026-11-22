@@ -30,3 +30,4 @@
 .lifehacker.tw
 .kapwing.com
 .sliceyt.com
+.stolendata.net

@@ -1,4 +1,5 @@
 import re
+import csv
 import sys
 import json
 import base64
@@ -15,13 +16,14 @@ ANKI_CONNECT_URL = "http://localhost:8765"
 DEFAULT_DATA_DIR = "data"
 DEFAULT_DELETE_BACKUP_SUBDIR = "delete_backup"
 DEFAULT_TSV_NAME = "anki_export.tsv"
+DEFAULT_SUSPEND_CSV_NAME = "suspend_audit.csv"
 CLOZE_PATTERN = re.compile(r"\{\{\s*(.+?)\s*\}\}")
 # 匹配 %% 注释 %% 跨行，非贪婪
 COMMENT_BLOCK_PATTERN = re.compile(r"%%.*?%%", re.DOTALL)
 # 匹配独占一行的 --- 分隔符
 CARD_SEP_PATTERN = re.compile(r"(?m)^---\s*$")
-# 匹配 #toanki/xxx/yyy  [可选 @suspend]，#toanki/ 前允许 0 个或多个空格/Tab
-DECK_HEAD_PATTERN = re.compile(r"^[ \t]*#toanki/(.*?)(\s+@suspend)?\s*$")
+# 匹配 #toanki/xxx/yyy  [可选 @suspended 或 @active]，#toanki/ 前允许 0 个或多个空格/Tab
+DECK_HEAD_PATTERN = re.compile(r"^[ \t]*#toanki/(.*?)(?:\s+@(suspended|active))?\s*$", re.IGNORECASE)
 # 匹配单行卡片中的 #toanki/... 卡组标记（#toanki/ 前允许 0 个或多个空格/Tab）
 INLINE_DECK_PATTERN = re.compile(r"[ \t]*#toanki/[^\s<]*")
 # 匹配行首可能存在的脚注 [^1]:、无序列表 - 、有序列表 1.
@@ -60,10 +62,14 @@ class Card:
     card_type: str  # "basic" | "cloze"
     deck: str
     tags: List[str] = field(default_factory=list)
-    suspend: bool = False
+    suspend_action: Optional[str] = None  # "suspended" | "active" | None(不指定则尊重Anki端状态)
     front: str = ""
     back: str = ""
     source_file: str = ""  # 原始md文件名，自动填入source字段
+
+    @property
+    def suspend(self) -> bool:
+        return self.suspend_action == "suspended"
 
     @property
     def model_name(self) -> str:
@@ -89,8 +95,8 @@ def strip_comments(text: str) -> str:
 def parse_inline_card_meta(raw_meta: str) -> Dict[str, object]:
     """
     灵活解析单行注释内的键值属性，支持任意空格与全/半角分隔符：
-    <!-- uuid: eee1731945600124;suspend -->
-    <!--uuid:eee1731945600124; suspend ; tags: a, b-->
+    <!-- uuid: eee1731945600124;suspended -->
+    <!-- uuid: eee1731945600124; @active ; tags: a, b -->
     """
     prop_dict: Dict[str, object] = {}
     for part in re.split(r"[;；]+", raw_meta):
@@ -103,7 +109,8 @@ def parse_inline_card_meta(raw_meta: str) -> Dict[str, object]:
             val = kv_match.group(2).strip()
             prop_dict[key] = val
         else:
-            prop_dict[token.lower()] = True
+            flag = token.lstrip("@").strip().lower()
+            prop_dict[flag] = True
     return prop_dict
 
 
@@ -149,22 +156,22 @@ def escape_anki(s: str) -> str:
     return s.replace('"', '\\"')
 
 
-def parse_deck_line(line: str) -> Tuple[Optional[str], bool]:
+def parse_deck_line(line: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    解析 [0个或多个空格/Tab]#toanki/xxx/yyy [@suspend]
-    返回 (deck_name:Optional[str], suspend_flag:bool)
-    deck_name为None代表格式非法
+    解析 [0个或多个空格/Tab]#toanki/xxx/yyy [@suspended|@active]
+    返回 (deck_name:Optional[str], suspend_action:Optional[str])
+    deck_name为None代表格式非法；suspend_action 取值 "suspended" | "active" | None
     """
     m = DECK_HEAD_PATTERN.match(line)
     if not m:
-        return None, False
+        return None, None
     path_raw = m.group(1).strip()
-    has_suspend = bool(m.group(2))
+    flag_raw = m.group(2).lower() if m.group(2) else None
     parts = [p.strip() for p in path_raw.split("/") if p.strip()]
     if not parts:
-        return None, False
+        return None, None
     deck_name = "::".join(parts)
-    return deck_name, has_suspend
+    return deck_name, flag_raw
 
 
 def parse_tags(raw: Optional[str]) -> List[str]:
@@ -434,12 +441,12 @@ def is_deck_empty(deck_name: str) -> bool:
 def parse_plain_block(
     block_content: str,
     deck_anki: str,
-    suspend_flag: bool,
+    suspend_action: Optional[str],
     source_file: str = "",
     trailing_back_items: Optional[List[str]] = None,
 ) -> Tuple[Optional[Card], Optional[str]]:
     """
-    解析裸 ``` 块，块头部：Tags:/uuid: ；@suspend移到块外#toanki行
+    解析裸 ``` 块，块头部：Tags:/uuid: ；@suspended / @active 移到块外#toanki行
     使用独占一行的 --- 分隔正反面
     返回：(Card 或 None, 失败原因或 None)
     """
@@ -451,8 +458,6 @@ def parse_plain_block(
     for line in lines:
         stripped = line.strip()
         if in_header:
-            low = stripped.lower()
-            # 块内部不再识别 @suspend
             if stripped.startswith("Tags:"):
                 tags_raw = stripped.removeprefix("Tags:").strip()
                 continue
@@ -493,7 +498,7 @@ def parse_plain_block(
                 card_type="cloze",
                 deck=deck_name,
                 tags=tag_list,
-                suspend=suspend_flag,
+                suspend_action=suspend_action,
                 front=cloze_text,
                 back=combined_back,
                 source_file=source_file,
@@ -513,7 +518,7 @@ def parse_plain_block(
             card_type="basic",
             deck=deck_name,
             tags=tag_list,
-            suspend=suspend_flag,
+            suspend_action=suspend_action,
             front=front_text,
             back=combined_back,
             source_file=source_file,
@@ -537,7 +542,7 @@ def parse_anki_markdown(
     block_idx = 0
     while i < len(lines):
         line1 = lines[i] if i < len(lines) else ""
-        deck_name, suspend_flag = parse_deck_line(line1)
+        deck_name, suspend_action = parse_deck_line(line1)
         if deck_name is not None and (i + 1) < len(lines) and re.match(r"^\s*```\s*$", lines[i + 1]):
             start_idx = i + 1
             j = start_idx + 1
@@ -569,7 +574,7 @@ def parse_anki_markdown(
             card, err_reason = parse_plain_block(
                 raw_block,
                 deck_anki=deck_name,
-                suspend_flag=suspend_flag,
+                suspend_action=suspend_action,
                 source_file=source_file,
                 trailing_back_items=trailing_imgs,
             )
@@ -582,7 +587,8 @@ def parse_anki_markdown(
                     consumed_line_indices.add(k)
                 if not quiet:
                     print(
-                        f"✅ [{source_file}] 裸块解析成功 uuid={card.uuid}, type={card.card_type}, suspend={card.suspend}, 紧跟图片={len(trailing_imgs)}张"
+                        f"✅ [{source_file}] 裸块解析成功 uuid={card.uuid}, type={card.card_type}, "
+                        f"suspend_action={card.suspend_action or 'none'}, 紧跟图片={len(trailing_imgs)}张"
                     )
             block_idx += 1
             i = after_img_idx
@@ -612,7 +618,20 @@ def parse_anki_markdown(
             print(f"⚠️ [{source_file}] 单行卡片解析失败（缺少 uuid）：{line}")
             i += 1
             continue
-        need_suspend = bool(prop_dict.get("suspend", False))
+
+        has_suspended = bool(prop_dict.get("suspended", False))
+        has_active = bool(prop_dict.get("active", False))
+        if has_suspended and has_active:
+            print(f"⚠️ [{source_file}] 单行卡片 (uuid={uuid_val}) 解析失败（不能同时指定 suspended 与 active）：{line}")
+            i += 1
+            continue
+        if has_suspended:
+            suspend_action: Optional[str] = "suspended"
+        elif has_active:
+            suspend_action = "active"
+        else:
+            suspend_action = None
+
         tag_list = parse_tags(str(prop_dict["tags"])) if "tags" in prop_dict else []
         deck_match = INLINE_DECK_PATTERN.search(line)
         if not deck_match:
@@ -620,11 +639,17 @@ def parse_anki_markdown(
             i += 1
             continue
         deck_str = deck_match.group(0).strip()
-        deck_name, _ = parse_deck_line(deck_str)
+        deck_name, inline_deck_action = parse_deck_line(deck_str)
         if not deck_name:
             print(f"⚠️ [{source_file}] 单行卡片 (uuid={uuid_val}) 解析失败（卡组名不可为空）：{line}")
             i += 1
             continue
+        if inline_deck_action is not None:
+            if suspend_action is not None and suspend_action != inline_deck_action:
+                print(f"⚠️ [{source_file}] 单行卡片 (uuid={uuid_val}) 解析失败（卡组标记与注释内的 suspended/active 冲突）：{line}")
+                i += 1
+                continue
+            suspend_action = inline_deck_action
 
         main_text = INLINE_META_PATTERN.sub("", line)
         main_text = INLINE_DECK_PATTERN.sub("", main_text)
@@ -671,14 +696,17 @@ def parse_anki_markdown(
                     card_type="basic",
                     deck=deck_name,
                     tags=merged_tags,
-                    suspend=need_suspend,
+                    suspend_action=suspend_action,
                     front=front,
                     back=back,
                     source_file=source_file,
                 )
             )
             if not quiet:
-                print(f"✅ [{source_file}] 单行Basic解析成功 uuid={uuid_val}, suspend={need_suspend}")
+                print(
+                    f"✅ [{source_file}] 单行Basic解析成功 uuid={uuid_val}, "
+                    f"suspend_action={suspend_action or 'none'}"
+                )
         else:
             if not main_text:
                 print(f"⚠️ [{source_file}] 单行 Cloze (uuid={uuid_val}) 解析失败（挖空内容为空）：{line}")
@@ -695,14 +723,17 @@ def parse_anki_markdown(
                     card_type="cloze",
                     deck=deck_name,
                     tags=merged_tags,
-                    suspend=need_suspend,
+                    suspend_action=suspend_action,
                     front=cloze_text,
                     back=extra,
                     source_file=source_file,
                 )
             )
             if not quiet:
-                print(f"✅ [{source_file}] 单行Cloze解析成功 uuid={uuid_val}, suspend={need_suspend}")
+                print(
+                    f"✅ [{source_file}] 单行Cloze解析成功 uuid={uuid_val}, "
+                    f"suspend_action={suspend_action or 'none'}"
+                )
         i = j
     return cards
 
@@ -733,7 +764,10 @@ def export_tsv(cards: List[Card], out_path: Path):
             tag_str = ",".join(c.tags)
             front_clean = c.front.replace("\t", " ").replace("\r\n", "<br>").replace("\n", "<br>")
             back_clean = c.back.replace("\t", " ").replace("\r\n", "<br>").replace("\n", "<br>")
-            f.write(f"{c.uuid}\t{front_clean}\t{back_clean}\t{c.deck}\t{tag_str}\t{c.suspend}\t{c.source_file}\n")
+            md_suspend_label = c.suspend_action or ""
+            f.write(
+                f"{c.uuid}\t{front_clean}\t{back_clean}\t{c.deck}\t{tag_str}\t{md_suspend_label}\t{c.source_file}\n"
+            )
 
 
 def fetch_existing_uuid_notes() -> Dict[str, dict]:
@@ -742,11 +776,74 @@ def fetch_existing_uuid_notes() -> Dict[str, dict]:
         return {}
     infos = anki_invoke("notesInfo", {"notes": nids})
     mapping: Dict[str, dict] = {}
+    all_cids: List[int] = []
     for info in infos:
         aid = info.get("fields", {}).get("uuid", {}).get("value", "").strip()
         if aid:
             mapping[aid] = info
+            all_cids.extend(info.get("cards") or [])
+
+    # 批量查询 Anki 端卡片的挂起状态
+    suspended_cid_set: Set[int] = set()
+    if all_cids:
+        unique_cids = list(dict.fromkeys(all_cids))
+        flags = anki_invoke("areSuspended", {"cards": unique_cids})
+        for cid, is_susp in zip(unique_cids, flags):
+            if is_susp:
+                suspended_cid_set.add(cid)
+
+    for info in mapping.values():
+        cids = info.get("cards") or []
+        info["_is_suspended"] = any(cid in suspended_cid_set for cid in cids)
     return mapping
+
+
+def format_markdown_suspend_label(suspend_action: Optional[str]) -> str:
+    if suspend_action == "suspended":
+        return "@suspended"
+    if suspend_action == "active":
+        return "@active"
+    return "未指定"
+
+
+def build_suspend_audit_rows(
+    local_cards: List[Card],
+    existing_map: Dict[str, dict],
+) -> List[Dict[str, str]]:
+    """
+    仅当某张卡片 card.suspend 为 False 且 Anki 端当前处于挂起状态时，
+    打印“保持挂起（尊重 Anki 状态）”日志并记录到 audit_rows 中，其它情况不写入。
+    """
+    audit_rows: List[Dict[str, str]] = []
+    for c in local_cards:
+        existing = existing_map.get(c.uuid)
+        if existing is None:
+            continue
+        anki_is_suspended = bool(existing.get("_is_suspended", False))
+        if not c.suspend and anki_is_suspended:
+            print(
+                f"⏸️ [uuid={c.uuid}] 保持挂起（尊重 Anki 状态） | "
+                f"Anki=suspended, Markdown={format_markdown_suspend_label(c.suspend_action)}, source={c.source_file}"
+            )
+            audit_rows.append(
+                {
+                    "uuid": c.uuid,
+                    "anki状态": "suspended",
+                    "markdown状态": format_markdown_suspend_label(c.suspend_action),
+                    "source": c.source_file,
+                }
+            )
+    return audit_rows
+
+
+def export_suspend_audit_csv(rows: List[Dict[str, str]], out_path: Path):
+    """每次执行后覆盖输出挂起状态核对 CSV（仅包含 card.suspend=False 且 Anki 端挂起的卡片）"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["uuid", "anki状态", "markdown状态", "source"])
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"📊 已导出挂起状态核对表至: {out_path}（共 {len(rows)} 条，已覆盖更新）")
 
 
 def diff_cards(local_cards: List[Card], existing_map: Dict[str, dict], quiet: bool):
@@ -888,12 +985,15 @@ def push_to_anki(
     deck_list: List[str] = anki_invoke("deckNames")
     empty_deck_candidates: Set[str] = set()
     to_suspend_cids: List[int] = []
-    to_unsuspend_cids: List[int] = []
+    to_active_cids: List[int] = []
 
     for card in cards:
         try:
             if not quiet:
-                print(f"🔄 uuid={card.uuid}, deck={card.deck}, suspend={card.suspend}, tags={card.tags}")
+                print(
+                    f"🔄 uuid={card.uuid}, deck={card.deck}, "
+                    f"suspend_action={card.suspend_action or 'none'}, tags={card.tags}"
+                )
             if card.deck not in deck_list:
                 if not quiet:
                     print(f"📂 卡组不存在，自动创建: {card.deck}")
@@ -957,21 +1057,25 @@ def push_to_anki(
                 )
                 card_ids = anki_invoke("findCards", {"query": f"nid:{note_id}"})
                 print(f"➕ 新增笔记 uuid={card.uuid}, note_id={note_id}, card_ids={card_ids}")
+
+            # 仅在显式指定 @suspended 或 @active 时调整挂起状态；未指定时尊重 Anki 端已有状态
             if card_ids:
-                if card.suspend:
+                if card.suspend_action == "suspended":
                     to_suspend_cids.extend(card_ids)
-                else:
-                    to_unsuspend_cids.extend(card_ids)
+                elif card.suspend_action == "active":
+                    to_active_cids.extend(card_ids)
         except Exception as e:
             print(f"❌ 处理卡片异常 [uuid={card.uuid}]: {e}")
+
     if to_suspend_cids:
         anki_invoke("suspend", {"cards": list(dict.fromkeys(to_suspend_cids))})
         if not quiet:
-            print(f"⏸️ 批量暂停卡片数量={len(set(to_suspend_cids))}")
-    if to_unsuspend_cids:
-        anki_invoke("unsuspend", {"cards": list(dict.fromkeys(to_unsuspend_cids))})
+            print(f"⏸️ 批量暂停(@suspended)卡片数量={len(set(to_suspend_cids))}")
+    if to_active_cids:
+        anki_invoke("unsuspend", {"cards": list(dict.fromkeys(to_active_cids))})
         if not quiet:
-            print(f"▶️ 批量恢复卡片数量={len(set(to_unsuspend_cids))}")
+            print(f"▶️ 批量显式激活(@active)卡片数量={len(set(to_active_cids))}")
+
     if allow_delete:
         try:
             del_items: List[Tuple[str, dict]] = [
@@ -1024,7 +1128,9 @@ def push_to_anki(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Markdown同步Anki脚本，裸```块 + 单行格式，卡组#toanki/，@suspend写在卡组行末尾或注释内")
+    parser = argparse.ArgumentParser(
+        description="Markdown同步Anki脚本，裸```块 + 单行格式，卡组#toanki/，支持@suspended与@active显式解挂"
+    )
     parser.add_argument("dir", nargs="?", default="./notes", help="笔记目录")
     parser.add_argument("--toanki", action="store_true", help="写入Anki；不加则预览")
     parser.add_argument("--diff", action="store_true", help="差异预览模式：显示新增/更新/待删，不改动Anki")
@@ -1035,6 +1141,11 @@ def main():
     parser.add_argument("--append-tags", default="bear-app", help="追加标签，逗号分隔")
     parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="数据存放目录（默认：data）")
     parser.add_argument("--tsv", default=DEFAULT_TSV_NAME, help="导出 TSV 文件名或路径（默认存入 data/anki_export.tsv）")
+    parser.add_argument(
+        "--suspend-csv",
+        default=DEFAULT_SUSPEND_CSV_NAME,
+        help="导出挂起状态核对 CSV 文件名或路径（默认存入 data/suspend_audit.csv）",
+    )
     parser.add_argument(
         "--media-out-dir",
         default="",
@@ -1048,6 +1159,7 @@ def main():
     data_dir = Path(args.data_dir)
     backup_dir = data_dir / DEFAULT_DELETE_BACKUP_SUBDIR
     tsv_path = resolve_data_file_path(args.tsv, data_dir, DEFAULT_TSV_NAME)
+    suspend_csv_path = resolve_data_file_path(args.suspend_csv, data_dir, DEFAULT_SUSPEND_CSV_NAME)
     local_save_dir = Path(args.media_out_dir) if args.media_out_dir.strip() else None
     append_tags = parse_tags(args.append_tags)
     result_cards = scan_md_files(note_folder, quiet=args.quiet, append_tags=append_tags)
@@ -1072,9 +1184,12 @@ def main():
             print(f"\n❌ {e}")
             sys.exit(1)
 
+    audit_rows = build_suspend_audit_rows(result_cards, existing_map)
+
     if args.diff:
         diff_cards(result_cards, existing_map, args.quiet)
         export_tsv(result_cards, tsv_path)
+        export_suspend_audit_csv(audit_rows, suspend_csv_path)
         sys.exit(0)
 
     push_to_anki(
@@ -1090,6 +1205,7 @@ def main():
         local_save_dir=local_save_dir,
     )
     export_tsv(result_cards, tsv_path)
+    export_suspend_audit_csv(audit_rows, suspend_csv_path)
 
 
 if __name__ == "__main__":

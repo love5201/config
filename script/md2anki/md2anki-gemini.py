@@ -22,20 +22,30 @@ CLOZE_PATTERN = re.compile(r"\{\{\s*(.+?)\s*\}\}")
 COMMENT_BLOCK_PATTERN = re.compile(r"%%.*?%%", re.DOTALL)
 # 匹配独占一行的 --- 分隔符
 CARD_SEP_PATTERN = re.compile(r"(?m)^---\s*$")
-# 匹配 #toanki/xxx/yyy  [可选 @suspended 或 @active]，#toanki/ 前允许 0 个或多个空格/Tab
-DECK_HEAD_PATTERN = re.compile(r"^[ \t]*#toanki/(.*?)(?:\s+@(suspended|active))?\s*$", re.IGNORECASE)
+# 匹配 [可选脚注/无序列表/有序列表前缀]#toanki/xxx/yyy  [可选 @suspended 或 @active]，有序列表点后允许 0 个或多个空格
+DECK_HEAD_PATTERN = re.compile(
+    r"^[ \t]*(?:\[\^[^\]]+\]:\s*|-\s+|\d+\.\s*)?#toanki/(.*?)(?:\s+@(suspended|active))?\s*$",
+    re.IGNORECASE,
+)
 # 匹配单行卡片中的 #toanki/... 卡组标记（#toanki/ 前允许 0 个或多个空格/Tab）
 INLINE_DECK_PATTERN = re.compile(r"[ \t]*#toanki/[^\s<]*")
-# 匹配行首可能存在的脚注 [^1]:、无序列表 - 、有序列表 1.
-LINE_PREFIX_PATTERN = re.compile(r"^\s*(?:\[\^[^\]]+\]:\s*|-\s+|\d+\.\s+)")
+# 匹配行首可能存在的脚注 [^1]:、无序列表 - 、有序列表 1.（点后允许 0 个或多个空格）
+LINE_PREFIX_PATTERN = re.compile(r"^\s*(?:\[\^[^\]]+\]:\s*|-\s+|\d+\.\s*)")
 # 匹配单行卡片 HTML 注释元数据 <!-- ... -->
 INLINE_META_PATTERN = re.compile(r"<!--\s*(.*?)\s*-->")
 # 匹配单行卡片紧跟的无序列表补充行：前导0个或多个空格/Tab，- 后必须有1个空格
 INLINE_EXTRA_LINE_PATTERN = re.compile(r"^[ \t]*- ")
 MD_IMAGE_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
-SINGLE_IMAGE_LINE_PATTERN = re.compile(
+SINGLE_MEDIA_LINE_PATTERN = re.compile(
     r"^\s*!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)\s*(?:<!--.*?-->\s*)?$"
 )
+# 匹配 Bear 等导出的无感叹号独占一行链接，如 [胶原水光变白.mp3](%E8%83%B6%E5%8E%9F%E6%B0%B4%E5%85%89%E5%8F%98%E7%99%BD.mp3)<!-- {"embed":"true"} -->
+SINGLE_PLAIN_MEDIA_LINE_PATTERN = re.compile(
+    r"^\s*\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)\s*(?:<!--.*?-->\s*)?$"
+)
+SINGLE_IMAGE_LINE_PATTERN = SINGLE_MEDIA_LINE_PATTERN
+AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus", ".wma"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv", ".ogv", ".3gp"}
 MD_BASE64_IMG_PATTERN = re.compile(
     r"!\[(?P<alt>[^\]]*)\]\(data:image/(?P<ext>[a-zA-Z0-9+.-]+);base64,(?P<b64>[^)]+)\)"
 )
@@ -158,7 +168,7 @@ def escape_anki(s: str) -> str:
 
 def parse_deck_line(line: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    解析 [0个或多个空格/Tab]#toanki/xxx/yyy [@suspended|@active]
+    解析 [可选脚注/无序列表/有序列表前缀]#toanki/xxx/yyy [@suspended|@active]
     返回 (deck_name:Optional[str], suspend_action:Optional[str])
     deck_name为None代表格式非法；suspend_action 取值 "suspended" | "active" | None
     """
@@ -246,6 +256,39 @@ def build_base64_img_tag(img_path: Path, alt: str = "") -> str:
     return f'<img src="data:{mime};base64,{b64_str}"{alt_attr}>'
 
 
+def get_media_kind(raw_src: str) -> Optional[str]:
+    """返回 'audio' | 'video' | None"""
+    clean_src = unquote(raw_src).split("?", 1)[0].split("#", 1)[0].strip()
+    ext = Path(clean_src).suffix.lower()
+    if ext in AUDIO_EXTS:
+        return "audio"
+    if ext in VIDEO_EXTS:
+        return "video"
+    return None
+
+
+def is_audio_source(raw_src: str) -> bool:
+    return get_media_kind(raw_src) == "audio"
+
+
+def is_video_source(raw_src: str) -> bool:
+    return get_media_kind(raw_src) == "video"
+
+
+def build_av_tag_from_path(media_path: Path, kind: str) -> str:
+    """将本地音频或视频文件转为临时标记，供推送阶段存入 Anki 媒体库并转为 [sound:...]"""
+    raw_bytes = media_path.resolve().read_bytes()
+    b64_str = base64.b64encode(raw_bytes).decode("ascii")
+    ext = media_path.suffix.lower().lstrip(".") or ("mp4" if kind == "video" else "mp3")
+    filename = escape_anki(media_path.name)
+    prefix = "bear_vid" if kind == "video" else "bear_aud"
+    return (
+        f'<span data-anki-av-kind="{kind}" data-anki-av-prefix="{prefix}" '
+        f'data-anki-av-filename="{filename}" data-anki-av-ext="{ext}">'
+        f'data:{kind}/{ext};base64,{b64_str}</span>'
+    )
+
+
 def store_local_image_to_anki(img_path: Path, media_cache: Dict[Path, str]) -> str:
     resolved = img_path.resolve()
     if resolved in media_cache:
@@ -319,6 +362,70 @@ def extract_base64_in_text(
     return updated
 
 
+def extract_trailing_av_in_text(
+    text: str,
+    b64_cache: Dict[str, str],
+    toanki: bool,
+    quiet: bool,
+    uuid: str,
+    local_save_dir: Optional[Path] = None,
+) -> str:
+    if not text or "data-anki-av-filename=" not in text:
+        return text
+
+    av_span_pattern = re.compile(
+        r'<span\b[^>]*\bdata-anki-av-kind=["\']([^"\']*)["\'][^>]*'
+        r'\bdata-anki-av-prefix=["\']([^"\']*)["\'][^>]*'
+        r'\bdata-anki-av-filename=["\']([^"\']*)["\'][^>]*'
+        r'\bdata-anki-av-ext=["\']([^"\']*)["\'][^>]*>'
+        r"data:[^;]+;base64,([^<]+)</span>",
+        re.IGNORECASE,
+    )
+
+    def repl_av(match: re.Match) -> str:
+        kind = match.group(1).strip().lower()
+        prefix = match.group(2).strip() or ("bear_vid" if kind == "video" else "bear_aud")
+        orig_name = match.group(3).strip()
+        ext_raw = match.group(4).strip()
+        b64_raw = match.group(5)
+        icon = "🎬" if kind == "video" else "🔊"
+        label = "紧跟视频" if kind == "video" else "紧跟音频"
+        try:
+            raw_bytes, ext = decode_base64_image(b64_raw, ext_raw)
+        except Exception as e:
+            print(f"❌ [uuid={uuid}] {label} Base64 解码失败 ({orig_name}): {e}")
+            return match.group(0)
+        if not toanki:
+            if not quiet:
+                print(
+                    f"{icon} [预览][uuid={uuid}] 检测到{label}: {orig_name} "
+                    f"(格式={ext}, 大小={len(raw_bytes)} bytes)"
+                )
+            return f"[sound:{orig_name}]"
+        try:
+            stem = Path(orig_name).stem or kind or "media"
+            safe_stem = re.sub(r"[^\w\-]", "_", stem)
+            digest_full = hashlib.md5(raw_bytes).hexdigest()
+            if digest_full in b64_cache:
+                media_name = b64_cache[digest_full]
+            else:
+                media_name = f"{prefix}_{safe_stem}_{digest_full[:8]}.{ext}"
+                if local_save_dir is not None:
+                    local_save_dir.mkdir(parents=True, exist_ok=True)
+                    (local_save_dir / media_name).write_bytes(raw_bytes)
+                b64_data = base64.b64encode(raw_bytes).decode("ascii")
+                anki_invoke("storeMediaFile", {"filename": media_name, "data": b64_data})
+                b64_cache[digest_full] = media_name
+            if not quiet:
+                print(f"{icon} [uuid={uuid}] {label}已存为 Anki 媒体文件: {media_name}")
+            return f"[sound:{media_name}]"
+        except Exception as e:
+            print(f"❌ [uuid={uuid}] {label}上传 Anki 失败 ({orig_name}): {e}")
+            return match.group(0)
+
+    return av_span_pattern.sub(repl_av, text)
+
+
 def process_images_in_text(
     text: str,
     md_file_path: Optional[Path],
@@ -339,6 +446,14 @@ def process_images_in_text(
         uuid=uuid,
         local_save_dir=local_save_dir,
     )
+    text = extract_trailing_av_in_text(
+        text=text,
+        b64_cache=b64_cache,
+        toanki=toanki,
+        quiet=quiet,
+        uuid=uuid,
+        local_save_dir=local_save_dir,
+    )
     if "![" not in text:
         return text
     base_dir = md_file_path.parent if md_file_path else Path(".")
@@ -352,13 +467,32 @@ def process_images_in_text(
         if not candidate.is_absolute():
             candidate = base_dir / candidate
         if not candidate.exists() or not candidate.is_file():
-            print(f"⚠️ [uuid={uuid}] 图片文件不存在，跳过上传: {raw_src} (解析路径: {candidate})")
+            print(f"⚠️ [uuid={uuid}] 媒体文件不存在，跳过上传: {raw_src} (解析路径: {candidate})")
             return match.group(0)
         if not toanki:
             if not quiet:
-                print(f"🖼️ [预览][uuid={uuid}] 检测到本地图片: {candidate}")
+                print(f"🖼️ [预览][uuid={uuid}] 检测到本地媒体文件: {candidate}")
             return match.group(0)
         try:
+            av_kind = get_media_kind(raw_src)
+            if av_kind in ("audio", "video"):
+                raw_bytes = candidate.resolve().read_bytes()
+                digest_full = hashlib.md5(raw_bytes).hexdigest()
+                if digest_full in b64_cache:
+                    media_name = b64_cache[digest_full]
+                else:
+                    prefix = "bear_vid" if av_kind == "video" else "bear_aud"
+                    default_ext = ".mp4" if av_kind == "video" else ".mp3"
+                    safe_stem = re.sub(r"[^\w\-]", "_", candidate.stem) or av_kind
+                    suffix = candidate.suffix.lower() or default_ext
+                    media_name = f"{prefix}_{safe_stem}_{digest_full[:8]}{suffix}"
+                    if local_save_dir is not None:
+                        local_save_dir.mkdir(parents=True, exist_ok=True)
+                        (local_save_dir / media_name).write_bytes(raw_bytes)
+                    b64_data = base64.b64encode(raw_bytes).decode("ascii")
+                    anki_invoke("storeMediaFile", {"filename": media_name, "data": b64_data})
+                    b64_cache[digest_full] = media_name
+                return f"[sound:{media_name}]"
             media_name = store_local_image_to_anki(candidate, media_cache)
             if local_save_dir is not None:
                 local_save_dir.mkdir(parents=True, exist_ok=True)
@@ -366,7 +500,7 @@ def process_images_in_text(
             alt_attr = f' alt="{escape_anki(alt)}"' if alt else ""
             return f'<img src="{escape_anki(media_name)}"{alt_attr}>'
         except Exception as e:
-            print(f"❌ [uuid={uuid}] 上传图片失败 {candidate}: {e}")
+            print(f"❌ [uuid={uuid}] 上传媒体文件失败 {candidate}: {e}")
             return match.group(0)
 
     return MD_IMAGE_PATTERN.sub(repl, text)
@@ -379,21 +513,66 @@ def extract_trailing_images_after_block(
     uuid: str,
     quiet: bool = False,
 ) -> Tuple[List[str], int]:
-    img_tags: List[str] = []
+    """
+    提取闭合 ``` 后紧跟的若干行图片、音频或视频文件（不能有空行；遇到空行或非媒体行立即停止）。
+    支持 ![alt](path) 与 Bear 导出的无感叹号媒体行 [name.ext](path)<!-- {"embed":"true"} -->。
+    """
+    media_tags: List[str] = []
     base_dir = md_file_path.parent if md_file_path else Path(".")
     idx = start_line_idx
     while idx < len(lines):
         line = lines[idx]
+        # 严格要求紧跟，不能有空行
         if not line.strip():
             break
-        m = SINGLE_IMAGE_LINE_PATTERN.match(line)
+        m = SINGLE_MEDIA_LINE_PATTERN.match(line)
+        is_plain_media_line = False
+        if not m:
+            plain_m = SINGLE_PLAIN_MEDIA_LINE_PATTERN.match(line)
+            if plain_m and get_media_kind(plain_m.group("src")) is not None:
+                m = plain_m
+                is_plain_media_line = True
         if not m:
             break
         alt = m.group("alt").strip()
         raw_src = unquote(m.group("src").strip())
+        av_kind = get_media_kind(raw_src)
+        if av_kind in ("audio", "video"):
+            icon = "🎬" if av_kind == "video" else "🔊"
+            kind_cn = "视频" if av_kind == "video" else "音频"
+            if raw_src.startswith("data:"):
+                media_tags.append(raw_src)
+                idx += 1
+                continue
+            if raw_src.startswith(("http://", "https://")):
+                if not quiet:
+                    print(f"⚠️ [uuid={uuid}] 紧跟{kind_cn}为网络链接，跳过: {raw_src}")
+                idx += 1
+                continue
+            candidate = Path(raw_src)
+            if not candidate.is_absolute():
+                candidate = base_dir / candidate
+            if not candidate.exists() or not candidate.is_file():
+                print(f"⚠️ [uuid={uuid}] 紧跟{kind_cn}文件不存在，跳过: {raw_src} (解析路径: {candidate})")
+                idx += 1
+                continue
+            try:
+                tag = build_av_tag_from_path(candidate, kind=av_kind)
+                media_tags.append(tag)
+                if not quiet:
+                    link_desc = f"无感叹号{kind_cn}链接" if is_plain_media_line else f"紧跟{kind_cn}"
+                    print(f"{icon} [uuid={uuid}] 提取{link_desc}: {candidate.name}")
+            except Exception as e:
+                print(f"❌ [uuid={uuid}] 读取紧跟{kind_cn}失败 {candidate}: {e}")
+            idx += 1
+            continue
+
+        # 图片文件处理（仅处理 ![...](...) 语法）
+        if is_plain_media_line:
+            break
         if raw_src.startswith("data:"):
             alt_attr = f' alt="{escape_anki(alt)}"' if alt else ""
-            img_tags.append(f'<img src="{raw_src}"{alt_attr}>')
+            media_tags.append(f'<img src="{raw_src}"{alt_attr}>')
             idx += 1
             continue
         if raw_src.startswith(("http://", "https://")):
@@ -410,22 +589,22 @@ def extract_trailing_images_after_block(
             continue
         try:
             tag = build_base64_img_tag(candidate, alt=alt)
-            img_tags.append(tag)
+            media_tags.append(tag)
             if not quiet:
                 print(f"🖼️ [uuid={uuid}] 提取紧跟图片并转为 base64: {candidate.name}")
         except Exception as e:
             print(f"❌ [uuid={uuid}] 读取紧跟图片失败 {candidate}: {e}")
         idx += 1
-    return img_tags, idx
+    return media_tags, idx
 
 
 def append_to_back(existing_back: str, extra_items: List[str]) -> str:
     if not extra_items:
         return existing_back
-    joined_imgs = "\n".join(extra_items)
+    joined_media = "\n".join(extra_items)
     if existing_back.strip():
-        return f"{existing_back}\n\n{joined_imgs}"
-    return joined_imgs
+        return f"{existing_back}\n\n{joined_media}"
+    return joined_media
 
 
 def get_parent_deck_chain(deck_name: str) -> List[str]:
@@ -564,7 +743,7 @@ def parse_anki_markdown(
                 if s.startswith("uuid:"):
                     uuid_preview = s.removeprefix("uuid:").strip()
                     break
-            trailing_imgs, after_img_idx = extract_trailing_images_after_block(
+            trailing_media, after_media_idx = extract_trailing_images_after_block(
                 lines=lines,
                 start_line_idx=j + 1,
                 md_file_path=md_file_path,
@@ -576,22 +755,22 @@ def parse_anki_markdown(
                 deck_anki=deck_name,
                 suspend_action=suspend_action,
                 source_file=source_file,
-                trailing_back_items=trailing_imgs,
+                trailing_back_items=trailing_media,
             )
             if card is None:
                 print(f"⚠️ [{source_file}] 区块 {block_idx} (uuid={uuid_preview}): 解析失败（{err_reason}），跳过")
             else:
                 card.tags = list(dict.fromkeys(card.tags + extra_default_tags))
                 cards.append(card)
-                for k in range(j + 1, after_img_idx):
+                for k in range(j + 1, after_media_idx):
                     consumed_line_indices.add(k)
                 if not quiet:
                     print(
                         f"✅ [{source_file}] 裸块解析成功 uuid={card.uuid}, type={card.card_type}, "
-                        f"suspend_action={card.suspend_action or 'none'}, 紧跟图片={len(trailing_imgs)}张"
+                        f"suspend_action={card.suspend_action or 'none'}, 紧跟媒体={len(trailing_media)}项"
                     )
             block_idx += 1
-            i = after_img_idx
+            i = after_media_idx
         else:
             i += 1
 

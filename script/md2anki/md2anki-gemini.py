@@ -17,31 +17,34 @@ DEFAULT_DATA_DIR = "data"
 DEFAULT_DELETE_BACKUP_SUBDIR = "delete_backup"
 DEFAULT_TSV_NAME = "anki_export.tsv"
 DEFAULT_SUSPEND_CSV_NAME = "suspend_audit.csv"
+DEFAULT_META_WARN_CSV_NAME = "meta_dash_warnings.csv"
 CLOZE_PATTERN = re.compile(r"\{\{\s*(.+?)\s*\}\}")
-# 匹配 %% 注释 %% 跨行，非贪婪
 COMMENT_BLOCK_PATTERN = re.compile(r"%%.*?%%", re.DOTALL)
-# 匹配独占一行的 --- 分隔符
 CARD_SEP_PATTERN = re.compile(r"(?m)^---\s*$")
-# 匹配 [可选脚注/无序列表/有序列表前缀]#toanki/xxx/yyy  [可选 @suspended 或 @active]，有序列表点后允许 0 个或多个空格
 DECK_HEAD_PATTERN = re.compile(
-    r"^[ \t]*(?:\[\^[^\]]+\]:\s*|-\s+|\d+\.\s*)?#toanki/(.*?)(?:\s+@(suspended|active))?\s*$",
+    r"^[ \t]*(?:\[\^[^\]]+\]:\s*|[-*]\s+|\d+\.\s*)?#toanki/(.*?)(?:\s+@(suspended|active))?\s*$",
     re.IGNORECASE,
 )
-# 匹配单行卡片中的 #toanki/... 卡组标记（#toanki/ 前允许 0 个或多个空格/Tab）
-INLINE_DECK_PATTERN = re.compile(r"[ \t]*#toanki/[^\s<]*")
-# 匹配行首可能存在的脚注 [^1]:、无序列表 - 、有序列表 1.（点后允许 0 个或多个空格）
-LINE_PREFIX_PATTERN = re.compile(r"^\s*(?:\[\^[^\]]+\]:\s*|-\s+|\d+\.\s*)")
-# 匹配单行卡片 HTML 注释元数据 <!-- ... -->
-INLINE_META_PATTERN = re.compile(r"<!--\s*(.*?)\s*-->")
-# 匹配单行卡片紧跟的无序列表补充行：前导0个或多个空格/Tab，- 后必须有1个空格
+INLINE_DECK_PATTERN = re.compile(r"[ \t]*#toanki/[^\s<！!]*")
+LIST_HEAD_PATTERN = re.compile(r"^[ \t]*(?:[-*]\s+|\d+\.\s*)")
+LINE_PREFIX_PATTERN = re.compile(r"^\s*(?:\[\^[^\]]+\]:\s*|[-*]\s+|\d+\.\s*)")
+INLINE_META_PATTERN = re.compile(r"<[!！]-{1,2}—?\s*(.*?)\s*-{1,2}—?>")
 INLINE_EXTRA_LINE_PATTERN = re.compile(r"^[ \t]*- ")
 MD_IMAGE_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
-SINGLE_MEDIA_LINE_PATTERN = re.compile(
-    r"^\s*!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)\s*(?:<!--.*?-->\s*)?$"
+INLINE_BANG_MEDIA_PATTERN = re.compile(
+    r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)(?:\s*<[!！]-{1,2}—?.*?-{1,2}—?>)?"
 )
-# 匹配 Bear 等导出的无感叹号独占一行链接，如 [胶原水光变白.mp3](%E8%83%B6%E5%8E%9F%E6%B0%B4%E5%85%89%E5%8F%98%E7%99%BD.mp3)<!-- {"embed":"true"} -->
+INLINE_PLAIN_MEDIA_PATTERN = re.compile(
+    r"\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)(?:\s*<[!！]-{1,2}—?.*?-{1,2}—?>)?"
+)
+SINGLE_MEDIA_LINE_PATTERN = re.compile(
+    r"^\s*!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)\s*(?:<[!！]-{1,2}—?.*?-{1,2}—?>\s*)?$"
+)
 SINGLE_PLAIN_MEDIA_LINE_PATTERN = re.compile(
-    r"^\s*\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)\s*(?:<!--.*?-->\s*)?$"
+    r"^\s*\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)\s*(?:<[!！]-{1,2}—?.*?-{1,2}—?>\s*)?$"
+)
+INLINE_TRAILING_MEDIA_PATTERN = re.compile(
+    r"(?P<bang>!)?\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)(?:\s*<[!！]-{1,2}—?.*?-{1,2}—?>)?\s*$"
 )
 SINGLE_IMAGE_LINE_PATTERN = SINGLE_MEDIA_LINE_PATTERN
 AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus", ".wma"}
@@ -65,17 +68,16 @@ MIME_TYPES = {
     ".ico": "image/x-icon",
 }
 
-
 @dataclass
 class Card:
     uuid: str
-    card_type: str  # "basic" | "cloze"
+    card_type: str
     deck: str
     tags: List[str] = field(default_factory=list)
-    suspend_action: Optional[str] = None  # "suspended" | "active" | None(不指定则尊重Anki端状态)
+    suspend_action: Optional[str] = None
     front: str = ""
     back: str = ""
-    source_file: str = ""  # 原始md文件名，自动填入source字段
+    source_file: str = ""
 
     @property
     def suspend(self) -> bool:
@@ -88,8 +90,12 @@ class Card:
         return "Cloze-md2anki"
 
 
+@dataclass
+class ParseContext:
+    meta_dash_warnings: List[Dict[str, str]] = field(default_factory=list)
+
+
 def resolve_data_file_path(raw_path: str, data_dir: Path, default_name: str) -> Path:
-    """将导出文件路径统一归入 data_dir（若传入含目录的路径则按指定路径处理）"""
     cleaned = raw_path.strip() if raw_path and raw_path.strip() else default_name
     p = Path(cleaned)
     if p.is_absolute() or len(p.parts) > 1:
@@ -98,16 +104,10 @@ def resolve_data_file_path(raw_path: str, data_dir: Path, default_name: str) -> 
 
 
 def strip_comments(text: str) -> str:
-    """移除 %% ... %% 注释块，跨行支持"""
     return COMMENT_BLOCK_PATTERN.sub("", text)
 
 
 def parse_inline_card_meta(raw_meta: str) -> Dict[str, object]:
-    """
-    灵活解析单行注释内的键值属性，支持任意空格与全/半角分隔符：
-    <!-- uuid: eee1731945600124;suspended -->
-    <!-- uuid: eee1731945600124; @active ; tags: a, b -->
-    """
     prop_dict: Dict[str, object] = {}
     for part in re.split(r"[;；]+", raw_meta):
         token = part.strip()
@@ -122,6 +122,18 @@ def parse_inline_card_meta(raw_meta: str) -> Dict[str, object]:
             flag = token.lstrip("@").strip().lower()
             prop_dict[flag] = True
     return prop_dict
+
+
+def classify_nonstandard_comment(raw_comment: str) -> Optional[Tuple[str, str]]:
+    has_bang = "！" in raw_comment
+    has_em_dash = "—" in raw_comment
+    if has_bang and has_em_dash:
+        return ("fullwidth_bang_and_em_dash", "全角感叹号 `！` 与全角破折号 `—`")
+    if has_bang:
+        return ("fullwidth_bang", "全角感叹号 `！`")
+    if has_em_dash:
+        return ("fullwidth_em_dash", "全角破折号 `—`")
+    return None
 
 
 def anki_invoke(action: str, params: Optional[dict] = None):
@@ -148,7 +160,6 @@ def anki_invoke(action: str, params: Optional[dict] = None):
 
 
 def check_anki_connect() -> bool:
-    """检查 AnkiConnect 是否可用，不可用时打印明确提示并返回 False"""
     try:
         ver = anki_invoke("version")
         print(f"🔌 已连接 AnkiConnect (API v{ver})")
@@ -167,11 +178,6 @@ def escape_anki(s: str) -> str:
 
 
 def parse_deck_line(line: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    解析 [可选脚注/无序列表/有序列表前缀]#toanki/xxx/yyy [@suspended|@active]
-    返回 (deck_name:Optional[str], suspend_action:Optional[str])
-    deck_name为None代表格式非法；suspend_action 取值 "suspended" | "active" | None
-    """
     m = DECK_HEAD_PATTERN.match(line)
     if not m:
         return None, None
@@ -193,7 +199,6 @@ def parse_tags(raw: Optional[str]) -> List[str]:
 
 
 def to_cloze_text(text: str) -> Optional[str]:
-    """所有挖空统一使用 c1，不再递增编号"""
     if not CLOZE_PATTERN.search(text):
         return None
 
@@ -257,7 +262,6 @@ def build_base64_img_tag(img_path: Path, alt: str = "") -> str:
 
 
 def get_media_kind(raw_src: str) -> Optional[str]:
-    """返回 'audio' | 'video' | None"""
     clean_src = unquote(raw_src).split("?", 1)[0].split("#", 1)[0].strip()
     ext = Path(clean_src).suffix.lower()
     if ext in AUDIO_EXTS:
@@ -267,16 +271,7 @@ def get_media_kind(raw_src: str) -> Optional[str]:
     return None
 
 
-def is_audio_source(raw_src: str) -> bool:
-    return get_media_kind(raw_src) == "audio"
-
-
-def is_video_source(raw_src: str) -> bool:
-    return get_media_kind(raw_src) == "video"
-
-
 def build_av_tag_from_path(media_path: Path, kind: str) -> str:
-    """将本地音频或视频文件转为临时标记，供推送阶段存入 Anki 媒体库并转为 [sound:...]"""
     raw_bytes = media_path.resolve().read_bytes()
     b64_str = base64.b64encode(raw_bytes).decode("ascii")
     ext = media_path.suffix.lower().lstrip(".") or ("mp4" if kind == "video" else "mp3")
@@ -505,6 +500,157 @@ def process_images_in_text(
 
     return MD_IMAGE_PATTERN.sub(repl, text)
 
+def _resolve_single_media_match(
+    has_bang: bool,
+    alt: str,
+    raw_src_quoted: str,
+    md_file_path: Optional[Path],
+    uuid: str,
+    quiet: bool = False,
+    source_desc: str = "紧跟媒体",
+) -> Optional[str]:
+    raw_src = unquote(raw_src_quoted.strip())
+    av_kind = get_media_kind(raw_src)
+    base_dir = md_file_path.parent if md_file_path else Path(".")
+
+    if av_kind in ("audio", "video"):
+        icon = "🎬" if av_kind == "video" else "🔊"
+        kind_cn = "视频" if av_kind == "video" else "音频"
+        if raw_src.startswith("data:"):
+            return raw_src
+        if raw_src.startswith(("http://", "https://")):
+            if not quiet:
+                print(f"⚠️ [uuid={uuid}] {source_desc}{kind_cn}为网络链接，跳过: {raw_src}")
+            return None
+        candidate = Path(raw_src)
+        if not candidate.is_absolute():
+            candidate = base_dir / candidate
+        if not candidate.exists() or not candidate.is_file():
+            print(f"⚠️ [uuid={uuid}] {source_desc}{kind_cn}文件不存在，跳过: {raw_src} (解析路径: {candidate})")
+            return None
+        try:
+            tag = build_av_tag_from_path(candidate, kind=av_kind)
+            if not quiet:
+                print(f"{icon} [uuid={uuid}] 提取{source_desc}{kind_cn}: {candidate.name}")
+            return tag
+        except Exception as e:
+            print(f"❌ [uuid={uuid}] 读取{source_desc}{kind_cn}失败 {candidate}: {e}")
+            return None
+
+    if not has_bang:
+        return None
+    if raw_src.startswith("data:"):
+        alt_attr = f' alt="{escape_anki(alt)}"' if alt else ""
+        return f'<img src="{raw_src}"{alt_attr}>'
+    if raw_src.startswith(("http://", "https://")):
+        if not quiet:
+            print(f"⚠️ [uuid={uuid}] {source_desc}图片为网络链接，跳过转为 base64: {raw_src}")
+        return None
+    candidate = Path(raw_src)
+    if not candidate.is_absolute():
+        candidate = base_dir / candidate
+    if not candidate.exists() or not candidate.is_file():
+        print(f"⚠️ [uuid={uuid}] {source_desc}图片文件不存在，跳过: {raw_src} (解析路径: {candidate})")
+        return None
+    try:
+        tag = build_base64_img_tag(candidate, alt=alt)
+        if not quiet:
+            print(f"🖼️ [uuid={uuid}] 提取{source_desc}图片并转为 base64: {candidate.name}")
+        return tag
+    except Exception as e:
+        print(f"❌ [uuid={uuid}] 读取{source_desc}图片失败 {candidate}: {e}")
+        return None
+
+
+def extract_inline_trailing_media(
+    line_after_meta: str,
+    md_file_path: Optional[Path],
+    uuid: str,
+    quiet: bool = False,
+) -> Tuple[str, List[str]]:
+    trailing_tags: List[str] = []
+    remaining = line_after_meta
+    while True:
+        m = INLINE_TRAILING_MEDIA_PATTERN.search(remaining)
+        if not m:
+            break
+        has_bang = bool(m.group("bang"))
+        alt = m.group("alt").strip()
+        raw_src = m.group("src")
+        clean_src = unquote(raw_src.strip()).split("?", 1)[0].split("#", 1)[0].strip()
+        is_known_media = has_bang or (Path(clean_src).suffix.lower() in (AUDIO_EXTS | VIDEO_EXTS))
+        if not is_known_media:
+            break
+        tag = _resolve_single_media_match(
+            has_bang=has_bang,
+            alt=alt,
+            raw_src_quoted=raw_src,
+            md_file_path=md_file_path,
+            uuid=uuid,
+            quiet=quiet,
+            source_desc="单行行尾紧跟",
+        )
+        if tag is not None:
+            trailing_tags.insert(0, tag)
+        remaining = remaining[: m.start()].rstrip()
+    return remaining, trailing_tags
+
+
+def extract_media_from_trailing_line(
+    line: str,
+    md_file_path: Optional[Path],
+    uuid: str,
+    quiet: bool = False,
+    source_desc: str = "紧跟",
+) -> List[str]:
+    stripped = line.strip()
+    if not stripped:
+        return []
+
+    matched_tags: List[str] = []
+    bang_matches = list(INLINE_BANG_MEDIA_PATTERN.finditer(stripped))
+    if bang_matches:
+        rem = INLINE_BANG_MEDIA_PATTERN.sub("", stripped).strip()
+        if rem:
+            return []
+        for m in bang_matches:
+            tag = _resolve_single_media_match(
+                has_bang=True,
+                alt=m.group("alt").strip(),
+                raw_src_quoted=m.group("src"),
+                md_file_path=md_file_path,
+                uuid=uuid,
+                quiet=quiet,
+                source_desc=source_desc,
+            )
+            if tag is not None:
+                matched_tags.append(tag)
+        return matched_tags
+
+    plain_matches = list(INLINE_PLAIN_MEDIA_PATTERN.finditer(stripped))
+    if not plain_matches:
+        return []
+    rem = INLINE_PLAIN_MEDIA_PATTERN.sub("", stripped).strip()
+    if rem:
+        return []
+
+    for m in plain_matches:
+        if get_media_kind(m.group("src")) is None:
+            return []
+    for m in plain_matches:
+        tag = _resolve_single_media_match(
+            has_bang=False,
+            alt=m.group("alt").strip(),
+            raw_src_quoted=m.group("src"),
+            md_file_path=md_file_path,
+            uuid=uuid,
+            quiet=quiet,
+            source_desc=source_desc,
+        )
+        if tag is not None:
+            matched_tags.append(tag)
+    return matched_tags
+
 
 def extract_trailing_images_after_block(
     lines: List[str],
@@ -513,87 +659,22 @@ def extract_trailing_images_after_block(
     uuid: str,
     quiet: bool = False,
 ) -> Tuple[List[str], int]:
-    """
-    提取闭合 ``` 后紧跟的若干行图片、音频或视频文件（不能有空行；遇到空行或非媒体行立即停止）。
-    支持 ![alt](path) 与 Bear 导出的无感叹号媒体行 [name.ext](path)<!-- {"embed":"true"} -->。
-    """
     media_tags: List[str] = []
-    base_dir = md_file_path.parent if md_file_path else Path(".")
     idx = start_line_idx
     while idx < len(lines):
         line = lines[idx]
-        # 严格要求紧跟，不能有空行
         if not line.strip():
             break
-        m = SINGLE_MEDIA_LINE_PATTERN.match(line)
-        is_plain_media_line = False
-        if not m:
-            plain_m = SINGLE_PLAIN_MEDIA_LINE_PATTERN.match(line)
-            if plain_m and get_media_kind(plain_m.group("src")) is not None:
-                m = plain_m
-                is_plain_media_line = True
-        if not m:
+        line_tags = extract_media_from_trailing_line(
+            line=line,
+            md_file_path=md_file_path,
+            uuid=uuid,
+            quiet=quiet,
+            source_desc="紧跟",
+        )
+        if not line_tags:
             break
-        alt = m.group("alt").strip()
-        raw_src = unquote(m.group("src").strip())
-        av_kind = get_media_kind(raw_src)
-        if av_kind in ("audio", "video"):
-            icon = "🎬" if av_kind == "video" else "🔊"
-            kind_cn = "视频" if av_kind == "video" else "音频"
-            if raw_src.startswith("data:"):
-                media_tags.append(raw_src)
-                idx += 1
-                continue
-            if raw_src.startswith(("http://", "https://")):
-                if not quiet:
-                    print(f"⚠️ [uuid={uuid}] 紧跟{kind_cn}为网络链接，跳过: {raw_src}")
-                idx += 1
-                continue
-            candidate = Path(raw_src)
-            if not candidate.is_absolute():
-                candidate = base_dir / candidate
-            if not candidate.exists() or not candidate.is_file():
-                print(f"⚠️ [uuid={uuid}] 紧跟{kind_cn}文件不存在，跳过: {raw_src} (解析路径: {candidate})")
-                idx += 1
-                continue
-            try:
-                tag = build_av_tag_from_path(candidate, kind=av_kind)
-                media_tags.append(tag)
-                if not quiet:
-                    link_desc = f"无感叹号{kind_cn}链接" if is_plain_media_line else f"紧跟{kind_cn}"
-                    print(f"{icon} [uuid={uuid}] 提取{link_desc}: {candidate.name}")
-            except Exception as e:
-                print(f"❌ [uuid={uuid}] 读取紧跟{kind_cn}失败 {candidate}: {e}")
-            idx += 1
-            continue
-
-        # 图片文件处理（仅处理 ![...](...) 语法）
-        if is_plain_media_line:
-            break
-        if raw_src.startswith("data:"):
-            alt_attr = f' alt="{escape_anki(alt)}"' if alt else ""
-            media_tags.append(f'<img src="{raw_src}"{alt_attr}>')
-            idx += 1
-            continue
-        if raw_src.startswith(("http://", "https://")):
-            if not quiet:
-                print(f"⚠️ [uuid={uuid}] 紧跟图片为网络链接，跳过转为 base64: {raw_src}")
-            idx += 1
-            continue
-        candidate = Path(raw_src)
-        if not candidate.is_absolute():
-            candidate = base_dir / candidate
-        if not candidate.exists() or not candidate.is_file():
-            print(f"⚠️ [uuid={uuid}] 紧跟图片文件不存在，跳过: {raw_src} (解析路径: {candidate})")
-            idx += 1
-            continue
-        try:
-            tag = build_base64_img_tag(candidate, alt=alt)
-            media_tags.append(tag)
-            if not quiet:
-                print(f"🖼️ [uuid={uuid}] 提取紧跟图片并转为 base64: {candidate.name}")
-        except Exception as e:
-            print(f"❌ [uuid={uuid}] 读取紧跟图片失败 {candidate}: {e}")
+        media_tags.extend(line_tags)
         idx += 1
     return media_tags, idx
 
@@ -624,11 +705,6 @@ def parse_plain_block(
     source_file: str = "",
     trailing_back_items: Optional[List[str]] = None,
 ) -> Tuple[Optional[Card], Optional[str]]:
-    """
-    解析裸 ``` 块，块头部：Tags:/uuid: ；@suspended / @active 移到块外#toanki行
-    使用独占一行的 --- 分隔正反面
-    返回：(Card 或 None, 失败原因或 None)
-    """
     lines = block_content.splitlines()
     in_header = True
     tags_raw: Optional[str] = None
@@ -650,7 +726,6 @@ def parse_plain_block(
     deck_name = deck_anki
     tag_list = parse_tags(tags_raw)
     body_text = "\n".join(body_lines)
-    # 移除 %%注释
     body_text = strip_comments(body_text)
 
     sep_match = CARD_SEP_PATTERN.search(body_text)
@@ -705,13 +780,13 @@ def parse_plain_block(
         None,
     )
 
-
 def parse_anki_markdown(
     md_text: str,
     source_file: str = "",
     md_file_path: Optional[Path] = None,
     quiet: bool = False,
     append_tags: Optional[List[str]] = None,
+    parse_ctx: Optional[ParseContext] = None,
 ) -> List[Card]:
     extra_default_tags = parse_tags(",".join(append_tags)) if append_tags else ["bear-app"]
     cards: List[Card] = []
@@ -783,7 +858,6 @@ def parse_anki_markdown(
             i += 1
             continue
         line = lines[i]
-        # 只要同一行存在 #toanki/ 和 <!-- ... -->，即判定为单行卡片
         if "#toanki/" not in line:
             i += 1
             continue
@@ -791,8 +865,27 @@ def parse_anki_markdown(
         if not attr_match:
             i += 1
             continue
+        raw_comment_snippet = attr_match.group(0)
+        nonstd_info = classify_nonstandard_comment(raw_comment_snippet)
         prop_dict = parse_inline_card_meta(attr_match.group(1))
         uuid_val = str(prop_dict.get("uuid", "")).strip()
+        if nonstd_info is not None:
+            warn_type, warn_desc = nonstd_info
+            warn_msg = (
+                f"⚠️ [{source_file}:{i + 1}] (uuid={uuid_val or 'unknown'}) "
+                f"检测到非标准注释符号（{warn_desc}）：{raw_comment_snippet}，建议改为 <!-- ... -->"
+            )
+            print(warn_msg)
+            if parse_ctx is not None:
+                parse_ctx.meta_dash_warnings.append(
+                    {
+                        "uuid": uuid_val,
+                        "warning_type": warn_type,
+                        "raw_comment": raw_comment_snippet,
+                        "source": source_file,
+                        "line": str(i + 1),
+                    }
+                )
         if not uuid_val:
             print(f"⚠️ [{source_file}] 单行卡片解析失败（缺少 uuid）：{line}")
             i += 1
@@ -830,23 +923,35 @@ def parse_anki_markdown(
                 continue
             suspend_action = inline_deck_action
 
-        main_text = INLINE_META_PATTERN.sub("", line)
-        main_text = INLINE_DECK_PATTERN.sub("", main_text)
-        # 过滤行头可能存在的 [^1]:、无序列表 - 、有序列表 1.
+        has_list_head = bool(LIST_HEAD_PATTERN.match(line))
+
+        after_meta_str = line[attr_match.end() :]
+        before_meta_str = line[: attr_match.start()]
+        inline_media_tags: List[str] = []
+        if after_meta_str.strip():
+            cleaned_after, inline_media_tags = extract_inline_trailing_media(
+                line_after_meta=after_meta_str,
+                md_file_path=md_file_path,
+                uuid=uuid_val,
+                quiet=quiet,
+            )
+            line_for_body = before_meta_str + cleaned_after
+        else:
+            line_for_body = before_meta_str
+
+        main_text = INLINE_DECK_PATTERN.sub("", line_for_body)
         main_text = LINE_PREFIX_PATTERN.sub("", main_text).strip()
         main_text = strip_comments(main_text)
 
-        # 收集紧跟在单行卡片下方的补充列表（前导0个或多个空格，- 后必须有1个空格，遇到空行则停止）
         extra_lines: List[str] = []
+        multiline_media_tags: List[str] = []
         j = i + 1
         while j < len(lines):
             if j in consumed_line_indices:
                 break
             subline = lines[j]
-            # 遇到空行则不属于当前卡片内容
             if not subline.strip():
                 break
-            # 若该行本身是另一张单行卡片，停止收集
             if "#toanki/" in subline and INLINE_META_PATTERN.search(subline):
                 break
             if INLINE_EXTRA_LINE_PATTERN.match(subline):
@@ -854,9 +959,24 @@ def parse_anki_markdown(
                 s = strip_comments(s)
                 extra_lines.append(s)
                 j += 1
+            elif not has_list_head:
+                sub_tags = extract_media_from_trailing_line(
+                    line=subline,
+                    md_file_path=md_file_path,
+                    uuid=uuid_val,
+                    quiet=quiet,
+                    source_desc="单行换行紧跟",
+                )
+                if sub_tags:
+                    multiline_media_tags.extend(sub_tags)
+                    j += 1
+                else:
+                    break
             else:
                 break
-        extra = "\n".join(extra_lines)
+
+        extra_text = "\n".join(extra_lines)
+        combined_back = append_to_back(extra_text, inline_media_tags + multiline_media_tags)
         merged_tags = list(dict.fromkeys(tag_list + extra_default_tags))
         if "::" in main_text:
             front, back = main_text.split("::", 1)
@@ -869,6 +989,7 @@ def parse_anki_markdown(
                 print(f"⚠️ [{source_file}] 单行 Basic (uuid={uuid_val}) 解析失败（背面为空）：{line}")
                 i = j
                 continue
+            full_back = append_to_back(back, inline_media_tags + multiline_media_tags)
             cards.append(
                 Card(
                     uuid=uuid_val,
@@ -877,14 +998,14 @@ def parse_anki_markdown(
                     tags=merged_tags,
                     suspend_action=suspend_action,
                     front=front,
-                    back=back,
+                    back=full_back,
                     source_file=source_file,
                 )
             )
             if not quiet:
                 print(
                     f"✅ [{source_file}] 单行Basic解析成功 uuid={uuid_val}, "
-                    f"suspend_action={suspend_action or 'none'}"
+                    f"suspend_action={suspend_action or 'none'}, 紧跟媒体={len(inline_media_tags) + len(multiline_media_tags)}项"
                 )
         else:
             if not main_text:
@@ -904,20 +1025,24 @@ def parse_anki_markdown(
                     tags=merged_tags,
                     suspend_action=suspend_action,
                     front=cloze_text,
-                    back=extra,
+                    back=combined_back,
                     source_file=source_file,
                 )
             )
             if not quiet:
                 print(
                     f"✅ [{source_file}] 单行Cloze解析成功 uuid={uuid_val}, "
-                    f"suspend_action={suspend_action or 'none'}"
+                    f"suspend_action={suspend_action or 'none'}, 紧跟媒体={len(inline_media_tags) + len(multiline_media_tags)}项"
                 )
         i = j
     return cards
 
-
-def scan_md_files(folder: Path, quiet: bool = False, append_tags: Optional[List[str]] = None) -> List[Card]:
+def scan_md_files(
+    folder: Path,
+    quiet: bool = False,
+    append_tags: Optional[List[str]] = None,
+    parse_ctx: Optional[ParseContext] = None,
+) -> List[Card]:
     all_cards: List[Card] = []
     for f in sorted(folder.rglob("*.md")):
         try:
@@ -929,11 +1054,21 @@ def scan_md_files(folder: Path, quiet: bool = False, append_tags: Optional[List[
                 md_file_path=f,
                 quiet=quiet,
                 append_tags=append_tags,
+                parse_ctx=parse_ctx,
             )
             all_cards.extend(cards)
         except Exception as e:
             print(f"❌ 读取文件失败 {f}: {e}")
     return all_cards
+
+
+def export_meta_dash_warnings_csv(rows: List[Dict[str, str]], out_path: Path):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["uuid", "warning_type", "raw_comment", "source", "line"])
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"⚠️ 已导出注释符号告警表至: {out_path}（共 {len(rows)} 条，已覆盖更新）")
 
 
 def export_tsv(cards: List[Card], out_path: Path):
@@ -962,7 +1097,6 @@ def fetch_existing_uuid_notes() -> Dict[str, dict]:
             mapping[aid] = info
             all_cids.extend(info.get("cards") or [])
 
-    # 批量查询 Anki 端卡片的挂起状态
     suspended_cid_set: Set[int] = set()
     if all_cids:
         unique_cids = list(dict.fromkeys(all_cids))
@@ -989,10 +1123,6 @@ def build_suspend_audit_rows(
     local_cards: List[Card],
     existing_map: Dict[str, dict],
 ) -> List[Dict[str, str]]:
-    """
-    仅当某张卡片 card.suspend 为 False 且 Anki 端当前处于挂起状态时，
-    打印“保持挂起（尊重 Anki 状态）”日志并记录到 audit_rows 中，其它情况不写入。
-    """
     audit_rows: List[Dict[str, str]] = []
     for c in local_cards:
         existing = existing_map.get(c.uuid)
@@ -1016,7 +1146,6 @@ def build_suspend_audit_rows(
 
 
 def export_suspend_audit_csv(rows: List[Dict[str, str]], out_path: Path):
-    """每次执行后覆盖输出挂起状态核对 CSV（仅包含 card.suspend=False 且 Anki 端挂起的卡片）"""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["uuid", "anki状态", "markdown状态", "source"])
@@ -1026,7 +1155,6 @@ def export_suspend_audit_csv(rows: List[Dict[str, str]], out_path: Path):
 
 
 def diff_cards(local_cards: List[Card], existing_map: Dict[str, dict], quiet: bool):
-    """diff模式，输出新增、更新、待删除，不做修改"""
     local_dict: Dict[str, Card] = {c.uuid: c for c in local_cards}
     local_uuids = set(local_dict.keys())
     remote_uuids = set(existing_map.keys())
@@ -1117,7 +1245,6 @@ def confirm_deletion(
     ans = input("请输入 DELETE 确认删除（其他输入取消）: ").strip()
     return ans == "DELETE"
 
-
 def push_to_anki(
     cards: List[Card],
     existing_map: Dict[str, dict],
@@ -1180,14 +1307,12 @@ def push_to_anki(
                 deck_list.append(card.deck)
 
             existing = existing_map.get(card.uuid)
-            # =========模型变更检测============
             if existing is not None:
                 old_model = existing.get("modelName", "")
                 if old_model != card.model_name:
                     print(f"⚠️ [uuid={card.uuid}] 跳过同步！笔记模型发生变化：旧模型={old_model}，新模型={card.model_name}")
                     print("💡提示：AnkiConnect不支持变更笔记模型，请手动删除Anki内旧笔记后再重新同步。")
                     continue
-            # =================================
 
             if card.card_type == "basic":
                 fields = {
@@ -1237,7 +1362,6 @@ def push_to_anki(
                 card_ids = anki_invoke("findCards", {"query": f"nid:{note_id}"})
                 print(f"➕ 新增笔记 uuid={card.uuid}, note_id={note_id}, card_ids={card_ids}")
 
-            # 仅在显式指定 @suspended 或 @active 时调整挂起状态；未指定时尊重 Anki 端已有状态
             if card_ids:
                 if card.suspend_action == "suspended":
                     to_suspend_cids.extend(card_ids)
@@ -1326,6 +1450,11 @@ def main():
         help="导出挂起状态核对 CSV 文件名或路径（默认存入 data/suspend_audit.csv）",
     )
     parser.add_argument(
+        "--meta-warn-csv",
+        default=DEFAULT_META_WARN_CSV_NAME,
+        help="导出非标准注释符号（全角！/ 全角—）告警 CSV 文件名或路径（默认存入 data/meta_dash_warnings.csv）",
+    )
+    parser.add_argument(
         "--media-out-dir",
         default="",
         help="可选：将解码后的图片文件额外保存到指定本地目录（默认不额外落盘）",
@@ -1339,9 +1468,16 @@ def main():
     backup_dir = data_dir / DEFAULT_DELETE_BACKUP_SUBDIR
     tsv_path = resolve_data_file_path(args.tsv, data_dir, DEFAULT_TSV_NAME)
     suspend_csv_path = resolve_data_file_path(args.suspend_csv, data_dir, DEFAULT_SUSPEND_CSV_NAME)
+    meta_warn_csv_path = resolve_data_file_path(args.meta_warn_csv, data_dir, DEFAULT_META_WARN_CSV_NAME)
     local_save_dir = Path(args.media_out_dir) if args.media_out_dir.strip() else None
     append_tags = parse_tags(args.append_tags)
-    result_cards = scan_md_files(note_folder, quiet=args.quiet, append_tags=append_tags)
+    parse_ctx = ParseContext()
+    result_cards = scan_md_files(
+        note_folder,
+        quiet=args.quiet,
+        append_tags=append_tags,
+        parse_ctx=parse_ctx,
+    )
     seen: Set[str] = set()
     dup_set: Set[str] = set()
     for c in result_cards:
@@ -1349,6 +1485,7 @@ def main():
             dup_set.add(c.uuid)
         seen.add(c.uuid)
     if dup_set:
+        export_meta_dash_warnings_csv(parse_ctx.meta_dash_warnings, meta_warn_csv_path)
         print(f"\n❌ 错误：检测到重复uuid！{sorted(dup_set)}")
         print("❌ 终止运行，不会推送、删除、导出")
         sys.exit(1)
@@ -1356,10 +1493,12 @@ def main():
     existing_map: Dict[str, dict] = {}
     if args.diff or args.toanki:
         if not check_anki_connect():
+            export_meta_dash_warnings_csv(parse_ctx.meta_dash_warnings, meta_warn_csv_path)
             sys.exit(1)
         try:
             existing_map = fetch_existing_uuid_notes()
         except RuntimeError as e:
+            export_meta_dash_warnings_csv(parse_ctx.meta_dash_warnings, meta_warn_csv_path)
             print(f"\n❌ {e}")
             sys.exit(1)
 
@@ -1369,6 +1508,7 @@ def main():
         diff_cards(result_cards, existing_map, args.quiet)
         export_tsv(result_cards, tsv_path)
         export_suspend_audit_csv(audit_rows, suspend_csv_path)
+        export_meta_dash_warnings_csv(parse_ctx.meta_dash_warnings, meta_warn_csv_path)
         sys.exit(0)
 
     push_to_anki(
@@ -1385,6 +1525,7 @@ def main():
     )
     export_tsv(result_cards, tsv_path)
     export_suspend_audit_csv(audit_rows, suspend_csv_path)
+    export_meta_dash_warnings_csv(parse_ctx.meta_dash_warnings, meta_warn_csv_path)
 
 
 if __name__ == "__main__":

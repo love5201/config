@@ -67,6 +67,8 @@ MIME_TYPES = {
     ".bmp": "image/bmp",
     ".ico": "image/x-icon",
 }
+CUSTOM_KV_LINE_PATTERN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)[ \t]*:[ \t]*(.*)$")
+
 
 @dataclass
 class Card:
@@ -78,6 +80,8 @@ class Card:
     front: str = ""
     back: str = ""
     source_file: str = ""
+    note_type: Optional[str] = None
+    custom_fields: Dict[str, str] = field(default_factory=dict)
 
     @property
     def suspend(self) -> bool:
@@ -85,6 +89,8 @@ class Card:
 
     @property
     def model_name(self) -> str:
+        if self.note_type:
+            return self.note_type
         if self.card_type == "basic":
             return "Basic-md2anki"
         return "Cloze-md2anki"
@@ -500,6 +506,7 @@ def process_images_in_text(
 
     return MD_IMAGE_PATTERN.sub(repl, text)
 
+
 def _resolve_single_media_match(
     has_bang: bool,
     alt: str,
@@ -596,6 +603,17 @@ def extract_inline_trailing_media(
     return remaining, trailing_tags
 
 
+def _strip_media_line_comments(text: str) -> str:
+    return re.sub(r"<[!！]-{1,2}—?.*?-{1,2}—?>", "", text)
+
+
+INLINE_ANY_MEDIA_PATTERN = re.compile(
+    r"(?P<bang>!)\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+\"[^\"]*\")?\)(?:\s*<![!！]-{1,2}—?.*?-{1,2}—?>)?"
+    r"|"
+    r"\[(?P<p_alt>[^\]]*)\]\((?P<p_src>[^)\s]+)(?:\s+\"[^\"]*\")?\)(?:\s*<![!！]-{1,2}—?.*?-{1,2}—?>)?"
+)
+
+
 def extract_media_from_trailing_line(
     line: str,
     md_file_path: Optional[Path],
@@ -607,41 +625,30 @@ def extract_media_from_trailing_line(
     if not stripped:
         return []
 
-    matched_tags: List[str] = []
-    bang_matches = list(INLINE_BANG_MEDIA_PATTERN.finditer(stripped))
-    if bang_matches:
-        rem = INLINE_BANG_MEDIA_PATTERN.sub("", stripped).strip()
-        if rem:
-            return []
-        for m in bang_matches:
-            tag = _resolve_single_media_match(
-                has_bang=True,
-                alt=m.group("alt").strip(),
-                raw_src_quoted=m.group("src"),
-                md_file_path=md_file_path,
-                uuid=uuid,
-                quiet=quiet,
-                source_desc=source_desc,
-            )
-            if tag is not None:
-                matched_tags.append(tag)
-        return matched_tags
-
-    plain_matches = list(INLINE_PLAIN_MEDIA_PATTERN.finditer(stripped))
-    if not plain_matches:
+    matches = list(INLINE_ANY_MEDIA_PATTERN.finditer(stripped))
+    if not matches:
         return []
-    rem = INLINE_PLAIN_MEDIA_PATTERN.sub("", stripped).strip()
+
+    rem = _strip_media_line_comments(INLINE_ANY_MEDIA_PATTERN.sub("", stripped)).strip()
     if rem:
         return []
 
-    for m in plain_matches:
-        if get_media_kind(m.group("src")) is None:
-            return []
-    for m in plain_matches:
+    parsed_items: List[Tuple[bool, str, str]] = []
+    for m in matches:
+        if m.group("bang") is not None:
+            parsed_items.append((True, m.group("alt").strip(), m.group("src")))
+        else:
+            src_val = m.group("p_src")
+            if get_media_kind(src_val) is None:
+                return []
+            parsed_items.append((False, m.group("p_alt").strip(), src_val))
+
+    matched_tags: List[str] = []
+    for has_bang, alt, raw_src in parsed_items:
         tag = _resolve_single_media_match(
-            has_bang=False,
-            alt=m.group("alt").strip(),
-            raw_src_quoted=m.group("src"),
+            has_bang=has_bang,
+            alt=alt,
+            raw_src_quoted=raw_src,
             md_file_path=md_file_path,
             uuid=uuid,
             quiet=quiet,
@@ -650,7 +657,6 @@ def extract_media_from_trailing_line(
         if tag is not None:
             matched_tags.append(tag)
     return matched_tags
-
 
 def extract_trailing_images_after_block(
     lines: List[str],
@@ -679,6 +685,26 @@ def extract_trailing_images_after_block(
     return media_tags, idx
 
 
+def split_media_tags_by_type(media_tags: List[str]) -> Tuple[List[str], List[str]]:
+    audio_tags: List[str] = []
+    image_tags: List[str] = []
+    for tag in media_tags:
+        if 'data-anki-av-kind="audio"' in tag or tag.startswith("[sound:"):
+            audio_tags.append(tag)
+        elif tag.startswith("<img") or "data:image/" in tag:
+            image_tags.append(tag)
+    return audio_tags, image_tags
+
+
+def merge_field_with_media(existing_val: str, media_items: List[str], sep: str = "\n") -> str:
+    if not media_items:
+        return existing_val
+    joined = sep.join(media_items)
+    if existing_val.strip():
+        return f"{existing_val.strip()}{sep}{joined}"
+    return joined
+
+
 def append_to_back(existing_back: str, extra_items: List[str]) -> str:
     if not extra_items:
         return existing_back
@@ -698,6 +724,111 @@ def is_deck_empty(deck_name: str) -> bool:
     return len(cids) == 0
 
 
+def parse_custom_notetype_block(
+    lines: List[str],
+    note_type: str,
+    deck_anki: str,
+    suspend_action: Optional[str],
+    source_file: str = "",
+    trailing_back_items: Optional[List[str]] = None,
+) -> Tuple[Optional[Card], Optional[str]]:
+    tags_raw: Optional[str] = None
+    uuid: Optional[str] = None
+    fields_map: Dict[str, str] = {}
+    current_key: Optional[str] = None
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        m = CUSTOM_KV_LINE_PATTERN.match(stripped)
+        if m:
+            k = m.group(1).strip()
+            v = m.group(2).strip()
+            k_lower = k.lower()
+            if k_lower == "notetype":
+                current_key = None
+                continue
+            if k_lower == "uuid":
+                uuid = v
+                current_key = None
+                continue
+            if k_lower == "tags":
+                tags_raw = v
+                current_key = None
+                continue
+            fields_map[k] = v
+            current_key = k
+        else:
+            if current_key is not None:
+                prev = fields_map.get(current_key, "")
+                fields_map[current_key] = f"{prev}\n{raw_line}".strip() if prev else raw_line.strip()
+
+    if not uuid:
+        return None, "缺少 uuid"
+
+    for k in list(fields_map.keys()):
+        cleaned_v = strip_comments(fields_map[k]).strip()
+        fields_map[k] = cleaned_v.replace("\r\n", "<br>").replace("\n", "<br>")
+
+    audio_items, image_items = split_media_tags_by_type(trailing_back_items or [])
+
+    if note_type == "NCE1_Core":
+        for req_f in (
+            "Lesson",
+            "Sentence_EN",
+            "Sentence_CN",
+            "Target_Word",
+            "Target_Word_Hint",
+            "Phonetic_Notes",
+            "Audio",
+            "Image",
+        ):
+            fields_map.setdefault(req_f, "")
+        if not fields_map.get("Sentence_EN", "").strip() and not fields_map.get("Sentence_CN", "").strip():
+            return None, "NCE1_Core 缺少 Sentence_EN 或 Sentence_CN 内容"
+        if audio_items:
+            fields_map["Audio"] = merge_field_with_media(fields_map.get("Audio", ""), audio_items, sep=" ")
+        if image_items:
+            fields_map["Image"] = merge_field_with_media(fields_map.get("Image", ""), image_items, sep="\n")
+    else:
+        key_lookup = {k.lower(): k for k in fields_map.keys()}
+        if audio_items:
+            aud_key = key_lookup.get("audio", "Audio")
+            fields_map[aud_key] = merge_field_with_media(fields_map.get(aud_key, ""), audio_items, sep=" ")
+        if image_items:
+            img_key = key_lookup.get("image", "Image")
+            fields_map[img_key] = merge_field_with_media(fields_map.get(img_key, ""), image_items, sep="\n")
+
+    tag_list = parse_tags(tags_raw)
+    preview_front = (
+        fields_map.get("Sentence_EN")
+        or fields_map.get("front")
+        or fields_map.get("Front")
+        or next((v for v in fields_map.values() if v.strip()), "")
+    )
+    preview_back = (
+        fields_map.get("Sentence_CN")
+        or fields_map.get("back")
+        or fields_map.get("Back")
+        or ""
+    )
+
+    return (
+        Card(
+            uuid=uuid,
+            card_type="custom",
+            deck=deck_anki,
+            tags=tag_list,
+            suspend_action=suspend_action,
+            front=preview_front,
+            back=preview_back,
+            source_file=source_file,
+            note_type=note_type,
+            custom_fields=fields_map,
+        ),
+        None,
+    )
+
+
 def parse_plain_block(
     block_content: str,
     deck_anki: str,
@@ -706,6 +837,27 @@ def parse_plain_block(
     trailing_back_items: Optional[List[str]] = None,
 ) -> Tuple[Optional[Card], Optional[str]]:
     lines = block_content.splitlines()
+
+    detected_note_type: Optional[str] = None
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        m_nt = re.match(r"^noteType\s*:\s*(.+?)\s*$", s, re.IGNORECASE)
+        if m_nt:
+            detected_note_type = m_nt.group(1).strip()
+            break
+
+    if detected_note_type:
+        return parse_custom_notetype_block(
+            lines=lines,
+            note_type=detected_note_type,
+            deck_anki=deck_anki,
+            suspend_action=suspend_action,
+            source_file=source_file,
+            trailing_back_items=trailing_back_items,
+        )
+
     in_header = True
     tags_raw: Optional[str] = None
     uuid: Optional[str] = None
@@ -780,6 +932,7 @@ def parse_plain_block(
         None,
     )
 
+
 def parse_anki_markdown(
     md_text: str,
     source_file: str = "",
@@ -794,9 +947,11 @@ def parse_anki_markdown(
     lines = md_text.splitlines()
     i = 0
     block_idx = 0
+
     while i < len(lines):
         line1 = lines[i] if i < len(lines) else ""
         deck_name, suspend_action = parse_deck_line(line1)
+
         if deck_name is not None and (i + 1) < len(lines) and re.match(r"^\s*```\s*$", lines[i + 1]):
             start_idx = i + 1
             j = start_idx + 1
@@ -841,13 +996,68 @@ def parse_anki_markdown(
                     consumed_line_indices.add(k)
                 if not quiet:
                     print(
-                        f"✅ [{source_file}] 裸块解析成功 uuid={card.uuid}, type={card.card_type}, "
+                        f"✅ [{source_file}] 裸块解析成功 uuid={card.uuid}, model={card.model_name}, "
                         f"suspend_action={card.suspend_action or 'none'}, 紧跟媒体={len(trailing_media)}项"
                     )
             block_idx += 1
             i = after_media_idx
-        else:
-            i += 1
+            continue
+
+        if deck_name is not None and (i + 1) < len(lines):
+            next_s = lines[i + 1].strip()
+            if re.match(r"^noteType\s*:\s*\S+", next_s, re.IGNORECASE):
+                j = i + 1
+                block_lines: List[str] = []
+                while j < len(lines):
+                    cur_line = lines[j]
+                    cur_s = cur_line.strip()
+                    if not cur_s:
+                        break
+                    if re.match(r"^\s*```", cur_line):
+                        break
+                    next_deck, _ = parse_deck_line(cur_line)
+                    if next_deck is not None:
+                        break
+                    block_lines.append(cur_line)
+                    j += 1
+                uuid_preview = "unknown"
+                for bline in block_lines:
+                    s = bline.strip()
+                    if s.lower().startswith("uuid:"):
+                        uuid_preview = s.split(":", 1)[1].strip()
+                        break
+                trailing_media, after_media_idx = extract_trailing_images_after_block(
+                    lines=lines,
+                    start_line_idx=j,
+                    md_file_path=md_file_path,
+                    uuid=uuid_preview,
+                    quiet=quiet,
+                )
+                card, err_reason = parse_plain_block(
+                    "\n".join(block_lines),
+                    deck_anki=deck_name,
+                    suspend_action=suspend_action,
+                    source_file=source_file,
+                    trailing_back_items=trailing_media,
+                )
+                if card is None:
+                    print(f"⚠️ [{source_file}] 无围栏 noteType 区块 (uuid={uuid_preview}): 解析失败（{err_reason}），跳过")
+                else:
+                    card.tags = list(dict.fromkeys(card.tags + extra_default_tags))
+                    cards.append(card)
+                    for k in range(j, after_media_idx):
+                        consumed_line_indices.add(k)
+                    if not quiet:
+                        print(
+                            f"✅ [{source_file}] 无围栏 noteType 块解析成功 uuid={card.uuid}, "
+                            f"model={card.model_name}, suspend_action={card.suspend_action or 'none'}, "
+                            f"紧跟媒体={len(trailing_media)}项"
+                        )
+                block_idx += 1
+                i = after_media_idx
+                continue
+
+        i += 1
 
     if not quiet:
         print(f"\n[DEBUG {source_file}] 裸```块处理完毕，共解析 {block_idx} 个区块")
@@ -975,10 +1185,32 @@ def parse_anki_markdown(
             else:
                 break
 
-        extra_text = "\n".join(extra_lines)
-        combined_back = append_to_back(extra_text, inline_media_tags + multiline_media_tags)
+        meta_extra_val = str(prop_dict.get("extra", "")).strip()
         merged_tags = list(dict.fromkeys(tag_list + extra_default_tags))
+
+        # 判断单行卡片类型：
+        # 1) 含 {{...}} 挖空标记，且左侧主体不含 '::' 问答分隔 -> Cloze（此时右侧若出现 '::' 视为方案二的 inline extra）
+        # 2) 含 '::' 且未在左侧作为 Cloze 出现 -> Basic（Basic 不支持 extra 字段）
+        is_single_cloze = False
+        cloze_body_text = main_text
+        inline_extra_from_sep = ""
+
         if "::" in main_text:
+            left_part, right_part = main_text.split("::", 1)
+            if CLOZE_PATTERN.search(left_part):
+                is_single_cloze = True
+                cloze_body_text = left_part.strip()
+                inline_extra_from_sep = right_part.strip()
+        elif CLOZE_PATTERN.search(main_text):
+            is_single_cloze = True
+            cloze_body_text = main_text.strip()
+
+        if not is_single_cloze and "::" in main_text:
+            if meta_extra_val or extra_lines:
+                print(
+                    f"⚠️ [{source_file}:{i + 1}] 单行 Basic (uuid={uuid_val}) 检测到 extra 内容（注释 extra 或子列表），"
+                    f"Basic 卡片不支持 extra 字段，已忽略"
+                )
             front, back = main_text.split("::", 1)
             front, back = front.strip(), back.strip()
             if not front:
@@ -1008,15 +1240,26 @@ def parse_anki_markdown(
                     f"suspend_action={suspend_action or 'none'}, 紧跟媒体={len(inline_media_tags) + len(multiline_media_tags)}项"
                 )
         else:
-            if not main_text:
+            if not cloze_body_text:
                 print(f"⚠️ [{source_file}] 单行 Cloze (uuid={uuid_val}) 解析失败（挖空内容为空）：{line}")
                 i = j
                 continue
-            cloze_text = to_cloze_text(main_text)
+            cloze_text = to_cloze_text(cloze_body_text)
             if cloze_text is None:
                 print(f"⚠️ [{source_file}] 单行 Cloze (uuid={uuid_val}) 解析失败（缺少 {{{{}}}} 挖空标记）：{line}")
                 i = j
                 continue
+
+            cloze_extra_parts: List[str] = []
+            if meta_extra_val:
+                cloze_extra_parts.append(meta_extra_val)
+            if inline_extra_from_sep:
+                cloze_extra_parts.append(inline_extra_from_sep)
+            if extra_lines:
+                cloze_extra_parts.append("\n".join(extra_lines))
+            extra_text = "\n".join(cloze_extra_parts)
+            combined_back = append_to_back(extra_text, inline_media_tags + multiline_media_tags)
+
             cards.append(
                 Card(
                     uuid=uuid_val,
@@ -1036,6 +1279,7 @@ def parse_anki_markdown(
                 )
         i = j
     return cards
+
 
 def scan_md_files(
     folder: Path,
@@ -1077,7 +1321,12 @@ def export_tsv(cards: List[Card], out_path: Path):
         for c in cards:
             tag_str = ",".join(c.tags)
             front_clean = c.front.replace("\t", " ").replace("\r\n", "<br>").replace("\n", "<br>")
-            back_clean = c.back.replace("\t", " ").replace("\r\n", "<br>").replace("\n", "<br>")
+            if c.note_type:
+                extra_parts = [f"{k}={v}" for k, v in c.custom_fields.items()]
+                back_raw = " | ".join(extra_parts)
+            else:
+                back_raw = c.back
+            back_clean = back_raw.replace("\t", " ").replace("\r\n", "<br>").replace("\n", "<br>")
             md_suspend_label = c.suspend_action or ""
             f.write(
                 f"{c.uuid}\t{front_clean}\t{back_clean}\t{c.deck}\t{tag_str}\t{md_suspend_label}\t{c.source_file}\n"
@@ -1187,9 +1436,11 @@ def diff_cards(local_cards: List[Card], existing_map: Dict[str, dict], quiet: bo
     print(f"\n🔴 Markdown不存在，待删除卡片({len(delete_uuids)}):")
     for uid in sorted(delete_uuids)[:20]:
         info = existing_map[uid]
+        fields = info.get("fields", {})
         preview = (
-            info.get("fields", {}).get("front", {}).get("value")
-            or info.get("fields", {}).get("text", {}).get("value")
+            fields.get("front", {}).get("value")
+            or fields.get("text", {}).get("value")
+            or fields.get("Sentence_EN", {}).get("value")
             or ""
         ).replace("\n", " ")[:50]
         print(f"  - uuid={uid} preview={preview}")
@@ -1219,6 +1470,7 @@ def confirm_deletion(
         preview_val = (
             fields.get("front", {}).get("value")
             or fields.get("text", {}).get("value")
+            or fields.get("Sentence_EN", {}).get("value")
             or ""
         ).replace("\n", " ")[:40]
         print(f"  - uuid={aid} (nid={info.get('noteId')}): {preview_val}")
@@ -1245,6 +1497,7 @@ def confirm_deletion(
     ans = input("请输入 DELETE 确认删除（其他输入取消）: ").strip()
     return ans == "DELETE"
 
+
 def push_to_anki(
     cards: List[Card],
     existing_map: Dict[str, dict],
@@ -1259,6 +1512,8 @@ def push_to_anki(
 ):
     media_cache: Dict[Path, str] = {}
     b64_cache: Dict[str, str] = {}
+    model_fields_cache: Dict[str, Set[str]] = {}
+
     for c in cards:
         md_path = (note_folder / c.source_file) if c.source_file else None
         c.front = process_images_in_text(
@@ -1281,6 +1536,19 @@ def push_to_anki(
             uuid=c.uuid,
             local_save_dir=local_save_dir,
         )
+        if c.custom_fields:
+            for fk, fv in list(c.custom_fields.items()):
+                c.custom_fields[fk] = process_images_in_text(
+                    fv,
+                    md_path,
+                    media_cache,
+                    b64_cache,
+                    toanki=toanki,
+                    quiet=quiet,
+                    uuid=c.uuid,
+                    local_save_dir=local_save_dir,
+                )
+
     if not toanki:
         print("\n===== 仅预览模式，不写入 Anki =====")
         for c in cards:
@@ -1297,7 +1565,7 @@ def push_to_anki(
         try:
             if not quiet:
                 print(
-                    f"🔄 uuid={card.uuid}, deck={card.deck}, "
+                    f"🔄 uuid={card.uuid}, model={card.model_name}, deck={card.deck}, "
                     f"suspend_action={card.suspend_action or 'none'}, tags={card.tags}"
                 )
             if card.deck not in deck_list:
@@ -1314,7 +1582,23 @@ def push_to_anki(
                     print("💡提示：AnkiConnect不支持变更笔记模型，请手动删除Anki内旧笔记后再重新同步。")
                     continue
 
-            if card.card_type == "basic":
+            if card.note_type:
+                model_name = card.model_name
+                if model_name not in model_fields_cache:
+                    try:
+                        fnames = anki_invoke("modelFieldNames", {"modelName": model_name}) or []
+                        model_fields_cache[model_name] = set(fnames)
+                    except Exception as e:
+                        print(f"⚠️ 获取模板 [{model_name}] 字段列表失败: {e}")
+                        model_fields_cache[model_name] = set()
+
+                fields = dict(card.custom_fields)
+                allowed_fields = model_fields_cache.get(model_name, set())
+                if not allowed_fields or "uuid" in allowed_fields:
+                    fields["uuid"] = card.uuid
+                if allowed_fields and "source" in allowed_fields:
+                    fields["source"] = card.source_file
+            elif card.card_type == "basic":
                 fields = {
                     "front": card.front,
                     "back": card.back,
@@ -1432,7 +1716,7 @@ def push_to_anki(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Markdown同步Anki脚本，裸```块 + 单行格式，卡组#toanki/，支持@suspended与@active显式解挂"
+        description="Markdown同步Anki脚本，裸```块 + 单行格式 + noteType自定义模板，卡组#toanki/，支持@suspended与@active显式解挂"
     )
     parser.add_argument("dir", nargs="?", default="./notes", help="笔记目录")
     parser.add_argument("--toanki", action="store_true", help="写入Anki；不加则预览")

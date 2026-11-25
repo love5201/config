@@ -33,3 +33,4 @@
 .stolendata.net
 .1lou.me
 .subtitlecat.com
+.fliphtml5.com

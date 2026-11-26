@@ -4,6 +4,7 @@ import sys
 import json
 import base64
 import hashlib
+import asyncio
 import argparse
 from datetime import datetime
 from urllib.parse import unquote
@@ -18,6 +19,44 @@ DEFAULT_DELETE_BACKUP_SUBDIR = "delete_backup"
 DEFAULT_TSV_NAME = "anki_export.tsv"
 DEFAULT_SUSPEND_CSV_NAME = "suspend_audit.csv"
 DEFAULT_META_WARN_CSV_NAME = "meta_dash_warnings.csv"
+DEFAULT_TTS_CACHE_SUBDIR = "tts_cache"
+DEFAULT_TTS_REPLACE_NAME = "tts_replace.json"
+DEFAULT_TTS_ZH_VOICE = "zh-CN-XiaoxiaoNeural"
+DEFAULT_TTS_EN_VOICE = "en-US-EmmaMultilingualNeural"
+TTS_VOICE_PRESETS: Dict[str, str] = {
+    "zh": "zh-CN-XiaoxiaoNeural",
+    "cn": "zh-CN-XiaoxiaoNeural",
+    "zh-f": "zh-CN-XiaoxiaoNeural",
+    "xiaoxiao": "zh-CN-XiaoxiaoNeural",
+    "xiaoyi": "zh-CN-XiaoyiNeural",
+    "zh-m": "zh-CN-YunxiNeural",
+    "cn-m": "zh-CN-YunxiNeural",
+    "yunxi": "zh-CN-YunxiNeural",
+    "zh-tw": "zh-TW-HsiaoChenNeural",
+    "zh-hk": "zh-HK-HiuGaaiNeural",
+    "us": "en-US-EmmaMultilingualNeural",
+    "en": "en-US-EmmaMultilingualNeural",
+    "en-us": "en-US-EmmaMultilingualNeural",
+    "emma": "en-US-EmmaMultilingualNeural",
+    "sentence": "en-US-EmmaMultilingualNeural",
+    "ava": "en-US-AvaMultilingualNeural",
+    "dialog": "en-US-AvaMultilingualNeural",
+    "aria": "en-US-AriaNeural",
+    "jenny": "en-US-JennyNeural",
+    "word": "en-US-JennyNeural",
+    "us-m": "en-US-GuyNeural",
+    "uk": "en-GB-SoniaNeural",
+    "en-gb": "en-GB-SoniaNeural",
+    "sonia": "en-GB-SoniaNeural",
+    "libby": "en-GB-LibbyNeural",
+    "uk-m": "en-GB-RyanNeural",
+    "jp": "ja-JP-NanamiNeural",
+    "ja": "ja-JP-NanamiNeural",
+}
+TTS_SHORTCODE_PATTERN = re.compile(r"\[tts:((?:[^\[\]]|\[[^\[\]]*\])+?)\]", re.IGNORECASE)
+TTS_PRONOUNCE_PATTERN = re.compile(r"(?<!\{)\{([^{}=]+)=([^{}=]+)\}")
+TTS_PHONETIC_BRACKET_PATTERN = re.compile(r"\[[^\[\]\u4e00-\u9fff]+\]")
+CJK_CHAR_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 CLOZE_PATTERN = re.compile(r"\{\{\s*(.+?)\s*\}\}")
 COMMENT_BLOCK_PATTERN = re.compile(r"%%.*?%%", re.DOTALL)
 CARD_SEP_PATTERN = re.compile(r"(?m)^---\s*$")
@@ -112,34 +151,8 @@ def normalize_card_content(text: str) -> str:
     s = ESCAPED_BEAR_LINK_PATTERN.sub(r"[\1](\2)", s)
     s = CUSTOM_SCHEME_MD_LINK_PATTERN.sub(r'<a href="\2">\1</a>', s)
     s = IFRAME_BLOCK_PATTERN.sub(_compact_iframe_match, s)
-
-    lines = s.split("\n")
-    out_lines: List[str] = []
-    for idx, line in enumerate(lines):
-        next_line = lines[idx + 1] if idx + 1 < len(lines) else None
-        cur_is_list = bool(LIST_HEAD_PATTERN.match(line))
-        next_is_list = bool(next_line is not None and LIST_HEAD_PATTERN.match(next_line))
-        next_is_blank = bool(next_line is not None and not next_line.strip())
-        next_is_iframe = bool(next_line is not None and next_line.lstrip().lower().startswith("<iframe"))
-        cur_is_iframe = line.lstrip().lower().startswith("<iframe")
-
-        if (
-            next_line is not None
-            and line.strip()
-            and not next_is_blank
-            and not cur_is_list
-            and not next_is_list
-            and not cur_is_iframe
-            and not next_is_iframe
-            and not line.rstrip().endswith("<br>")
-        ):
-            out_lines.append(f"{line}<br>")
-        else:
-            out_lines.append(line)
-
-    joined = "\n".join(out_lines)
-    joined = re.sub(r"\n{3,}", "\n\n", joined).strip()
-    return joined.replace("\n", "<br>")
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s.replace("\n", "<br>")
 
 
 
@@ -499,6 +512,291 @@ def extract_trailing_av_in_text(
             return match.group(0)
 
     return av_span_pattern.sub(repl_av, text)
+
+
+def load_tts_replace_dict(
+    replace_path: Path,
+    explicit: bool = False,
+    quiet: bool = False,
+) -> Dict[str, str]:
+    if not replace_path.exists():
+        if explicit:
+            print(f"⚠️ 指定的 TTS 替换词典不存在，跳过加载: {replace_path}")
+        return {}
+    try:
+        raw_obj = json.loads(replace_path.read_text(encoding="utf-8"))
+        if not isinstance(raw_obj, dict):
+            print(f"⚠️ TTS 替换词典格式错误（顶层必须为 JSON 对象），跳过: {replace_path}")
+            return {}
+        cleaned: Dict[str, str] = {}
+        for k, v in raw_obj.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                continue
+            k_s = k.strip()
+            if not k_s or k_s.startswith("_"):
+                continue
+            cleaned[k_s] = v.strip()
+        if not quiet and cleaned:
+            print(f"📖 已加载 TTS 多音字替换词典: {replace_path}（共 {len(cleaned)} 条）")
+        return cleaned
+    except Exception as e:
+        print(f"⚠️ 加载 TTS 替换词典失败 ({replace_path}): {e}")
+        return {}
+
+
+def format_tts_display_text(raw_text: str) -> str:
+    """将 {原词=替读} 还原为用于卡片展示的 原词（保留挖空、下划线、注音等原有格式）"""
+    return TTS_PRONOUNCE_PATTERN.sub(lambda m: m.group(1), raw_text)
+
+
+def apply_tts_replace_dict(text: str, replace_dict: Optional[Dict[str, str]]) -> str:
+    if not text or not replace_dict:
+        return text
+    keys = sorted((k for k in replace_dict.keys() if k), key=len, reverse=True)
+    if not keys:
+        return text
+    pattern = re.compile("|".join(re.escape(k) for k in keys))
+    return pattern.sub(lambda m: replace_dict[m.group(0)], text)
+
+
+def clean_text_for_tts(
+    raw_text: str,
+    replace_dict: Optional[Dict[str, str]] = None,
+) -> str:
+    s = raw_text.strip()
+    # 1. 剥离 Anki 挖空语法 {{c1::答案::提示}} -> 答案，以及尚未转换的 {{答案}} -> 答案
+    s = re.sub(r"\{\{c\d+::(.*?)(?:::[^}]*)?\}\}", r"\1", s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r"\{\{\s*(.+?)\s*\}\}", r"\1", s, flags=re.DOTALL)
+
+    # 2. 提取并保护手动 {原词=替读} 规则（确保优先级高于全局词典，不被二次替换）
+    overrides: Dict[str, str] = {}
+
+    def _stash_override(m: re.Match) -> str:
+        token = f"@@TTSOVR{len(overrides)}@@"
+        overrides[token] = m.group(2).strip()
+        return token
+
+    s = TTS_PRONOUNCE_PATTERN.sub(_stash_override, s)
+
+    # 3. 剥离 Markdown 图片/链接 [文本](url) -> 文本
+    s = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", s)
+    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+    # 4. 过滤非中文方括号注音/音标（如 涤[dí]纶、handbag [ˈhændbæɡ]）
+    s = TTS_PHONETIC_BRACKET_PATTERN.sub("", s)
+    # 5. 换行转停顿，剥离 HTML 标签与 Markdown 修饰符
+    s = re.sub(r"<br\s*/?>", "，", s, flags=re.IGNORECASE)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = re.sub(r"\*\*|__|~~|`|~|\*", "", s)
+
+    # 6. 应用全局多音字替换词典（如 data/tts_replace.json）
+    s = apply_tts_replace_dict(s, replace_dict)
+
+    # 7. 还原手动 {原词=替读} 的替读文本
+    for token, spoken in overrides.items():
+        s = s.replace(token, spoken)
+
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def parse_tts_shortcode_body(
+    body: str,
+    default_zh_voice: str = DEFAULT_TTS_ZH_VOICE,
+    default_en_voice: str = DEFAULT_TTS_EN_VOICE,
+) -> Tuple[str, str, str, str, bool]:
+    """解析 [tts:内容|选项...]，返回 (raw_text, voice, rate, pitch, show_text)"""
+    parts = body.split("|")
+    voice: Optional[str] = None
+    rate = "+0%"
+    pitch = "+0Hz"
+    show_text = False
+
+    end_idx = len(parts)
+    while end_idx > 1:
+        token = parts[end_idx - 1].strip()
+        lower = token.lower()
+
+        if lower in ("show", "text", "keep", "show=1", "show=true"):
+            show_text = True
+            end_idx -= 1
+            continue
+        if lower in ("hide", "noshow", "show=0", "show=false"):
+            show_text = False
+            end_idx -= 1
+            continue
+        if lower in TTS_VOICE_PRESETS:
+            voice = TTS_VOICE_PRESETS[lower]
+            end_idx -= 1
+            continue
+        if lower == "slow":
+            rate = "-15%"
+            end_idx -= 1
+            continue
+        if lower == "slower":
+            rate = "-25%"
+            end_idx -= 1
+            continue
+        if lower == "fast":
+            rate = "+15%"
+            end_idx -= 1
+            continue
+        if lower == "faster":
+            rate = "+25%"
+            end_idx -= 1
+            continue
+
+        m_rate = re.match(r"^rate\s*=\s*([+-]?\d+)%$", token, re.IGNORECASE)
+        if m_rate:
+            num = m_rate.group(1)
+            rate = f"{num}%" if num.startswith(("+", "-")) else f"+{num}%"
+            end_idx -= 1
+            continue
+
+        m_pitch = re.match(r"^pitch\s*=\s*([+-]?\d+)hz$", token, re.IGNORECASE)
+        if m_pitch:
+            num = m_pitch.group(1)
+            pitch = f"{num}Hz" if num.startswith(("+", "-")) else f"+{num}Hz"
+            end_idx -= 1
+            continue
+
+        m_voice = re.match(r"^voice\s*=\s*([A-Za-z0-9_-]+)$", token, re.IGNORECASE)
+        if m_voice:
+            v_val = m_voice.group(1).strip()
+            voice = TTS_VOICE_PRESETS.get(v_val.lower(), v_val)
+            end_idx -= 1
+            continue
+
+        break
+
+    raw_text = "|".join(parts[:end_idx]).strip()
+    clean_for_detect = clean_text_for_tts(raw_text)
+    if not voice:
+        if CJK_CHAR_PATTERN.search(clean_for_detect):
+            voice = default_zh_voice
+        else:
+            voice = default_en_voice
+
+    return raw_text, voice, rate, pitch, show_text
+
+
+def synthesize_edge_tts_to_file(
+    text: str,
+    voice: str,
+    rate: str,
+    pitch: str,
+    out_path: Path,
+) -> None:
+    try:
+        import edge_tts  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(
+            "缺少 edge-tts 依赖，无法合成语音。请先运行：pip install edge-tts"
+        ) from e
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_suffix(".tmp.mp3")
+
+    async def _run():
+        communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
+        await communicate.save(str(tmp_path))
+
+    try:
+        asyncio.run(_run())
+        if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+            raise RuntimeError("edge-tts 返回了空音频文件")
+        tmp_path.replace(out_path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def process_tts_in_text(
+    text: str,
+    tts_cache_dir: Path,
+    tts_uploaded_cache: Set[str],
+    toanki: bool,
+    quiet: bool,
+    uuid: str,
+    default_zh_voice: str = DEFAULT_TTS_ZH_VOICE,
+    default_en_voice: str = DEFAULT_TTS_EN_VOICE,
+    local_save_dir: Optional[Path] = None,
+    disable_tts: bool = False,
+    tts_replace_dict: Optional[Dict[str, str]] = None,
+) -> str:
+    if not text or "[tts:" not in text.lower():
+        return text
+
+    def repl(match: re.Match) -> str:
+        full_shortcode = match.group(0)
+        body = match.group(1)
+        raw_text, voice, rate, pitch, show_text = parse_tts_shortcode_body(
+            body=body,
+            default_zh_voice=default_zh_voice,
+            default_en_voice=default_en_voice,
+        )
+        display_text = format_tts_display_text(raw_text)
+        clean_text = clean_text_for_tts(raw_text, replace_dict=tts_replace_dict)
+        if not clean_text:
+            print(f"⚠️ [uuid={uuid}] TTS 短码文本为空，跳过: {full_shortcode}")
+            return full_shortcode
+
+        fingerprint = hashlib.md5(
+            f"{voice}|{rate}|{pitch}|{clean_text}".encode("utf-8")
+        ).hexdigest()[:10]
+        media_name = f"bear_tts_{fingerprint}.mp3"
+        cache_path = tts_cache_dir / media_name
+        cache_hit = cache_path.exists() and cache_path.stat().st_size > 0
+        sound_tag = f"[sound:{media_name}]"
+
+        if disable_tts:
+            if not quiet:
+                print(f"🔇 [uuid={uuid}] 已启用 --no-tts，跳过合成: {clean_text[:30]}")
+            return display_text if show_text else full_shortcode
+
+        if not toanki:
+            if not quiet:
+                status = "命中缓存" if cache_hit else "待合成"
+                print(
+                    f"🗣️ [预览][uuid={uuid}] TTS({voice}, rate={rate}, show={show_text}, {status}): "
+                    f"{clean_text[:40]}"
+                )
+            return f"{display_text} {sound_tag}" if show_text else sound_tag
+
+        try:
+            if not cache_hit:
+                if not quiet:
+                    print(f"🗣️ [uuid={uuid}] 合成 TTS ({voice}, {rate}): {clean_text[:40]}")
+                synthesize_edge_tts_to_file(
+                    text=clean_text,
+                    voice=voice,
+                    rate=rate,
+                    pitch=pitch,
+                    out_path=cache_path,
+                )
+            elif not quiet:
+                print(f"🗣️ [uuid={uuid}] 复用本地 TTS 缓存: {media_name}")
+
+            raw_bytes = cache_path.read_bytes()
+            if local_save_dir is not None:
+                local_save_dir.mkdir(parents=True, exist_ok=True)
+                (local_save_dir / media_name).write_bytes(raw_bytes)
+
+            if media_name not in tts_uploaded_cache:
+                b64_data = base64.b64encode(raw_bytes).decode("ascii")
+                anki_invoke("storeMediaFile", {"filename": media_name, "data": b64_data})
+                tts_uploaded_cache.add(media_name)
+                if not quiet:
+                    print(f"🔊 [uuid={uuid}] TTS 音频已存入 Anki 媒体库: {media_name}")
+
+            return f"{display_text} {sound_tag}" if show_text else sound_tag
+        except Exception as e:
+            print(f"❌ [uuid={uuid}] TTS 合成或上传失败 ({clean_text[:30]}): {e}")
+            return full_shortcode
+
+    return TTS_SHORTCODE_PATTERN.sub(repl, text)
 
 
 def process_images_in_text(
@@ -1583,9 +1881,15 @@ def push_to_anki(
     max_delete: int = 20,
     quiet: bool = False,
     local_save_dir: Optional[Path] = None,
+    tts_cache_dir: Path = Path(DEFAULT_DATA_DIR) / DEFAULT_TTS_CACHE_SUBDIR,
+    tts_zh_voice: str = DEFAULT_TTS_ZH_VOICE,
+    tts_en_voice: str = DEFAULT_TTS_EN_VOICE,
+    disable_tts: bool = False,
+    tts_replace_dict: Optional[Dict[str, str]] = None,
 ):
     media_cache: Dict[Path, str] = {}
     b64_cache: Dict[str, str] = {}
+    tts_uploaded_cache: Set[str] = set()
     model_fields_cache: Dict[str, Set[str]] = {}
 
     for c in cards:
@@ -1600,6 +1904,19 @@ def push_to_anki(
             uuid=c.uuid,
             local_save_dir=local_save_dir,
         )
+        c.front = process_tts_in_text(
+            c.front,
+            tts_cache_dir=tts_cache_dir,
+            tts_uploaded_cache=tts_uploaded_cache,
+            toanki=toanki,
+            quiet=quiet,
+            uuid=c.uuid,
+            default_zh_voice=tts_zh_voice,
+            default_en_voice=tts_en_voice,
+            local_save_dir=local_save_dir,
+            disable_tts=disable_tts,
+            tts_replace_dict=tts_replace_dict,
+        )
         c.back = process_images_in_text(
             c.back,
             md_path,
@@ -1610,9 +1927,22 @@ def push_to_anki(
             uuid=c.uuid,
             local_save_dir=local_save_dir,
         )
+        c.back = process_tts_in_text(
+            c.back,
+            tts_cache_dir=tts_cache_dir,
+            tts_uploaded_cache=tts_uploaded_cache,
+            toanki=toanki,
+            quiet=quiet,
+            uuid=c.uuid,
+            default_zh_voice=tts_zh_voice,
+            default_en_voice=tts_en_voice,
+            local_save_dir=local_save_dir,
+            disable_tts=disable_tts,
+            tts_replace_dict=tts_replace_dict,
+        )
         if c.custom_fields:
             for fk, fv in list(c.custom_fields.items()):
-                c.custom_fields[fk] = process_images_in_text(
+                processed_v = process_images_in_text(
                     fv,
                     md_path,
                     media_cache,
@@ -1622,13 +1952,26 @@ def push_to_anki(
                     uuid=c.uuid,
                     local_save_dir=local_save_dir,
                 )
+                c.custom_fields[fk] = process_tts_in_text(
+                    processed_v,
+                    tts_cache_dir=tts_cache_dir,
+                    tts_uploaded_cache=tts_uploaded_cache,
+                    toanki=toanki,
+                    quiet=quiet,
+                    uuid=c.uuid,
+                    default_zh_voice=tts_zh_voice,
+                    default_en_voice=tts_en_voice,
+                    local_save_dir=local_save_dir,
+                    disable_tts=disable_tts,
+                    tts_replace_dict=tts_replace_dict,
+                )
 
     if not toanki:
         print("\n===== 仅预览模式，不写入 Anki =====")
         for c in cards:
             print(c)
         return
-    print("===== 🚀 正式推送模式 (md2anki v3.10) =====")
+    print("===== 🚀 正式推送模式 (md2anki v3.16) =====")
     local_uuid_set = {c.uuid for c in cards}
     deck_list: List[str] = anki_invoke("deckNames")
     empty_deck_candidates: Set[str] = set()
@@ -1845,7 +2188,32 @@ def main():
     parser.add_argument(
         "--media-out-dir",
         default="",
-        help="可选：将解码后的图片文件额外保存到指定本地目录（默认不额外落盘）",
+        help="可选：将解码后的图片/音频文件额外保存到指定本地目录（默认不额外落盘）",
+    )
+    parser.add_argument(
+        "--tts-cache-dir",
+        default="",
+        help="可选：TTS 音频本地缓存目录（默认存入 data/tts_cache）",
+    )
+    parser.add_argument(
+        "--tts-replace",
+        default="",
+        help="可选：TTS 多音字替换词典 JSON 路径（默认读取 data/tts_replace.json，不存在则忽略）",
+    )
+    parser.add_argument(
+        "--tts-zh-voice",
+        default=DEFAULT_TTS_ZH_VOICE,
+        help=f"默认中文 TTS 音色（默认：{DEFAULT_TTS_ZH_VOICE}，晓晓女声）",
+    )
+    parser.add_argument(
+        "--tts-en-voice",
+        default=DEFAULT_TTS_EN_VOICE,
+        help=f"默认英文 TTS 音色（默认：{DEFAULT_TTS_EN_VOICE}，Emma 美音女声）",
+    )
+    parser.add_argument(
+        "--no-tts",
+        action="store_true",
+        help="跳过 [tts:...] 语音合成（离线调试或纯文本同步时使用）",
     )
     args = parser.parse_args()
     note_folder = Path(args.dir)
@@ -1854,6 +2222,18 @@ def main():
         sys.exit(1)
     data_dir = Path(args.data_dir)
     backup_dir = data_dir / DEFAULT_DELETE_BACKUP_SUBDIR
+    tts_cache_dir = (
+        Path(args.tts_cache_dir)
+        if args.tts_cache_dir.strip()
+        else (data_dir / DEFAULT_TTS_CACHE_SUBDIR)
+    )
+    tts_replace_explicit = bool(args.tts_replace.strip())
+    tts_replace_path = resolve_data_file_path(
+        args.tts_replace, data_dir, DEFAULT_TTS_REPLACE_NAME
+    )
+    tts_replace_dict = load_tts_replace_dict(
+        tts_replace_path, explicit=tts_replace_explicit, quiet=args.quiet
+    )
     tsv_path = resolve_data_file_path(args.tsv, data_dir, DEFAULT_TSV_NAME)
     suspend_csv_path = resolve_data_file_path(args.suspend_csv, data_dir, DEFAULT_SUSPEND_CSV_NAME)
     meta_warn_csv_path = resolve_data_file_path(args.meta_warn_csv, data_dir, DEFAULT_META_WARN_CSV_NAME)
@@ -1910,6 +2290,11 @@ def main():
         max_delete=args.max_delete,
         quiet=args.quiet,
         local_save_dir=local_save_dir,
+        tts_cache_dir=tts_cache_dir,
+        tts_zh_voice=args.tts_zh_voice,
+        tts_en_voice=args.tts_en_voice,
+        disable_tts=args.no_tts,
+        tts_replace_dict=tts_replace_dict,
     )
     export_tsv(result_cards, tsv_path)
     export_suspend_audit_csv(audit_rows, suspend_csv_path)

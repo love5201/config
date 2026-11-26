@@ -1,132 +1,205 @@
-======================================================================
-Markdown 同步 Anki 工具 (md2anki) 使用说明
-======================================================================
+================================================================================
+Markdown 同步 Anki 与 YouTube 片段内嵌完整指南 (v3.10)
+================================================================================
 
-一、功能概述
-----------------------------------------------------------------------
-本工具用于扫描本地目录中的 Markdown (.md) 笔记文件，解析其中的自定义卡片格式，并通过 AnkiConnect 插件自动同步至桌面端 Anki。
-支持的功能包括：
-1. 支持裸代码块（多行）与单行卡片两种书写格式，自动识别 Basic（问答）与 Cloze（挖空）卡片类型。
-2. 自动创建多层嵌套卡组，支持卡片跨卡组自动迁移。
-3. 支持内联 Base64 图片及本地图片自动上传至 Anki 媒体库，并支持提取裸代码块下方紧跟的独立图片作为背面内容。
-4. 支持挂起状态精细控制（@suspended 挂起、@active 显式解挂、不填则尊重 Anki 端现有挂起状态）。
-5. 支持差异预览（--diff）、防误删保护与删除前 JSON 备份、TSV 导出以及挂起状态核对 CSV 导出。
+一、项目概述与工作流架构
+--------------------------------------------------------------------------------
+本方案打通了「Bear / Markdown 笔记 -> 本地 Python 同步脚本 -> Anki 桌面端 /
+AnkiMobile 移动端」的完整制卡与复习链路，核心特性包括：
 
-
-二、前置依赖与环境要求
-----------------------------------------------------------------------
-1. Python 3.8 及以上版本，需安装第三方依赖库 requests：
-   pip install requests
-2. 桌面端 Anki 需处于运行状态，且已安装并启用 AnkiConnect 插件（插件代码：2055492159），默认监听地址为 http://localhost:8765。
-3. Anki 中需预先存在以下两个笔记模板（Model），且包含对应字段：
-   - Basic-md2anki：需包含字段 front、back、uuid、source
-   - Cloze-md2anki：需包含字段 text、extra、uuid、source
+1. 多形态制卡语法：同时支持「单行卡片」「多行代码块卡片」及「自定义 noteType
+   模板卡片」，支持 Cloze 挖空与 Basic 问答。
+2. 媒体全自动托管：自动提取本地图片、内联 Base64 图片及音视频文件，通过
+   AnkiConnect 上传至 Anki 媒体库并转换为标准标签。
+3. 增强型卡片渲染：借助 xmarkdown.js 渲染 Markdown，同时在模板层完整保护
+   MathJax 数学公式、单波浪线 ~下划线~、原生音频胶囊栏及固定安全区页脚。
+4. 跨平台 YouTube 片段内嵌：通过 `[ytv:...]` 极简短码 + GitHub Pages 静态
+   中转页（yt.html），解决 AnkiMobile（iOS WKWebView）播放「错误 153」，
+   并自动提供携带起止时间的 YouTube 原生外链兜底。
 
 
-三、Markdown 卡片书写规范
-----------------------------------------------------------------------
-所有卡片必须包含唯一的 uuid 与 #toanki/ 卡组路径。支持使用 %% 注释内容 %% 添加隐藏注释（解析时会自动剔除）。
-
-1. 裸代码块卡片（适合多行内容、复杂排版或带图片卡片）
-   格式说明：
-   - 第一行写卡组路径：#toanki/父卡组/子卡组，行尾可选加 @suspended 或 @active。
-   - 紧接一行以 ``` 开头和结尾的代码块。
-   - 块内顶部元数据（可选顺序，置于正文前）：
-     Tags: 标签1, 标签2
-     uuid: 唯一标识字符串
-   - Basic 卡片需在正反面之间使用独占一行的 --- 分隔。
-   - Cloze 卡片无需 ---，在正面使用 {{挖空内容}} 标记（所有挖空统一生成 c1），若写 --- 则 --- 后内容作为背面 extra 字段。
-   - 闭合 ``` 后若紧跟若干行独立图片（不能有空行），会自动提取并追加到卡片背面。
-
-   示例（Basic 卡片）：
-   #toanki/计算机网络/传输层 @suspended
-   ```
-   Tags: TCP, 面试高频
-   uuid: net_tcp_001
-   TCP 三次握手的目的是什么？
-   ---
-   确认双方的发送和接收能力均正常，并同步初始序列号（ISN）。
-   ```
-
-   示例（Cloze 卡片）：
-   #toanki/机器学习/线性模型
-   ```
-   Tags: 损失函数
-   uuid: ml_loss_002
-   线性回归中最常用的损失函数是 {{均方误差 (MSE)}}。
-   ---
-   补充说明：对异常值较为敏感。
-   ```
-
-2. 单行卡片（适合简短问答与快速挖空）
-   格式说明：
-   - 同一行内必须同时包含 #toanki/卡组路径 与 HTML 注释元数据 <!-- ... -->。
-   - 元数据内支持字段：uuid（必填）、tags（可选，逗号分隔）、suspended 或 @suspended（可选）、active 或 @active（可选），各属性用分号 ; 分隔。
-   - 同一行中用 :: 分隔正面与背面，即为 Basic 卡片；若不含 :: 且包含 {{挖空内容}}，则为 Cloze 卡片。
-   - 单行卡片下方若紧跟无序列表行（以 - 开头，且中间无空行），会自动收集作为 Cloze 卡片的背面补充内容。
-
-   示例（单行 Basic 卡片）：
-   HTTP 状态码 404 的含义::请求的资源在服务器上不存在 #toanki/计算机网络/应用层 <!-- uuid: http_404; tags: HTTP; @suspended -->
-
-   示例（单行 Cloze 卡片）：
-   Python 中使用 {{yield}} 关键字定义生成器函数。 #toanki/Python/基础 <!-- uuid: py_gen_001; @active -->
-   - 调用生成器函数时不会立即执行函数体，而是返回一个迭代器对象。
+二、核心文件清单
+--------------------------------------------------------------------------------
+1. md2anki.py
+   - 本地同步主脚本，扫描指定目录下的 .md 文件，解析卡片并通过 AnkiConnect
+     （http://localhost:8765）增量新增、更新或安全删除 Anki 笔记。
+2. yt.html
+   - 静态 HTTPS 中转页面（部署地址：https://love5201.github.io/yt.html），
+     为移动端 WebView 提供合法的 Referer 请求头以正常加载 YouTube 播放器。
+3. cloze背面模板（HTML + JS）
+   - 卡片背面模板，负责提取顶部音频按钮、保护公式与 `[ytv:...]` 短码、调用
+     xmarkdown.js 渲染正文，并触发 MathJax 排版。
+4. css（卡片样式表）
+   - 统一控制挖空高亮、720px 居中阅读栏、extra 钢青蓝提示框、底部固定
+     source 页脚（适配 iPhone 底部安全区）、顶部胶囊音频栏及暗黑模式。
 
 
-四、命令行参数说明
-----------------------------------------------------------------------
-基本用法：
-python your_script.py [笔记目录] [选项]
+三、Markdown 制卡语法规范（md2anki.py）
+--------------------------------------------------------------------------------
+所有卡片均通过 `#toanki/卡组路径` 指定目标卡组（层级以 `/` 分隔，自动映射为
+Anki 的 `::` 层级），并可通过 `@suspended` 或 `@active` 控制卡片挂起状态。
 
-参数列表：
-  dir                   笔记所在目录路径，默认为 ./notes
-  --toanki              正式写入模式：将解析结果推送至 Anki；不加此参数时仅做本地预览，不连接也不修改 Anki
-  --diff                差异预览模式：连接 Anki 对比显示新增、更新、待删除卡片清单，不修改 Anki 数据
-  --allow-delete        允许删除 Anki 中存在但本地 Markdown 中已不存在的笔记，并自动清理变为空的子卡组（需配合 --toanki 使用）
-  --yes, -y             执行删除操作时跳过命令行交互输入 DELETE 的确认步骤
-  --max-delete N        防误删阈值：单次允许删除的最大笔记数量，默认为 20（设为 0 表示不限制）
-  --quiet               安静模式：减少常规解析与同步过程日志输出
-  --append-tags TAGS    为所有卡片默认追加的标签，多个标签用逗号分隔，默认为 bear-app
-  --data-dir DIR        数据输出根目录，默认为 data
-  --tsv PATH            导出 TSV 文件名或路径，默认保存为 data/anki_export.tsv
-  --suspend-csv PATH    导出挂起状态核对 CSV 文件名或路径，默认保存为 data/suspend_audit.csv
-  --media-out-dir DIR   可选参数：将解码后的图片文件额外保存到指定的本地目录（默认不额外落盘）
+【写法一：单行卡片】
+在行内同时包含 `#toanki/卡组` 与 HTML 注释元数据 `<!-- uuid: xxx; ... -->`：
+
+1. Single Basic（问答卡，使用 `::` 分隔正反面）：
+   问题内容 :: 答案内容 #toanki/英语/词汇 <!-- uuid: 1001; tags: vocab,unit1 -->
+
+2. Single Cloze（挖空卡，使用 `{{...}}` 标记挖空）：
+   爱因斯坦提出了{{质能方程}} $E=mc^2$。 #toanki/物理 <!-- uuid: 1002 -->
+
+   Single Cloze 附加 extra（补充解析）的三种方式（可组合使用）：
+   - 注释内指定：`<!-- uuid: 1002; extra: 补充说明 -->`
+   - 挖空后接 `::`：`问题{{挖空}} :: 补充说明 #toanki/物理 <!-- uuid: 1002 -->`
+   - 紧跟子列表：在单行卡片下方缩进或顶格写 `- 补充条目`
+
+3. 单行卡片紧跟媒体：
+   - 行尾直接追加 `![alt](image.png)` 或 `[audio](clip.mp3)`
+   - 或在下一行（非列表卡片）紧跟独立的图片/音视频行，自动归入背面。
+
+【写法二：多行代码块卡片】
+第一行为卡组声明，紧跟独占一行的 ``` 代码围栏：
+
+#toanki/计算机/网络 @active
+```
+Tags: http, tcp
+uuid: 2001
+什么是三次握手？
+---
+客户端与服务器建立 TCP 连接时交换的三个报文段：
+1. SYN
+2. SYN-ACK
+3. ACK
+```
+![示意图](assets/tcp_handshake.png)
+
+说明：
+- 若正文含 `{{...}}` 自动识别为 Cloze 模板（Cloze-md2anki），`---` 后为 extra；
+- 若正文不含 `{{...}}` 自动识别为 Basic 模板（Basic-md2anki），`---` 为必填；
+- 闭合 ``` 后紧跟的图片/音视频行（空行前）会自动提取并追加到卡片背面。
+
+【写法三：自定义模板卡片（noteType）】
+支持围栏或无围栏写法，首行写 `#toanki/卡组`，次行写 `noteType: 模板名`：
+
+#toanki/新概念/第一册
+noteType: NCE1_Core
+uuid: 3001
+tags: lesson1
+Lesson: Lesson 1
+Sentence_EN: Excuse me!
+Sentence_CN: 对不起！
+Target_Word: excuse
+![配图](assets/l1.jpg)
+[朗读](assets/l1.mp3)
+
+说明：紧跟的音频自动合并至 `Audio` 字段，图片自动合并至 `Image` 字段。
 
 
-五、常用命令示例
-----------------------------------------------------------------------
-1. 本地解析预览（不连接 Anki）：
-   python your_script.py ./notes
+四、YouTube 视频片段短码规范（[ytv:...]）
+--------------------------------------------------------------------------------
+在卡片正文（text）或补充字段（extra）中写入短码，模板会自动将其展开为
+16:9 响应式播放器 + 中转页链接 + 原生 YouTube 跳转按钮。
 
-2. 对比本地与 Anki 的差异（不改动 Anki）：
-   python your_script.py ./notes --diff
+1. 标准语法（第 1 段固定为视频 ID，后续参数以 `|` 分隔，顺序任意）：
+   [ytv:VIDEO_ID|start|end|autoplay|lazy=0]
 
-3. 正式同步新增与更新卡片（不执行删除）：
-   python your_script.py ./notes --toanki
+2. 参数说明：
+   - VIDEO_ID（必填）：YouTube 视频编号（如 4g5HOnKB4vY）。
+   - start（可选）   ：起始时间，支持纯秒数（1265）、分秒（21:05）或
+                       时分秒（01:02:10）；留空默认从 0s 开始。
+   - end（可选）     ：结束时间，格式同 start；留空默认播放至结尾。
+   - autoplay（可选）：默认【不自动播放】。
+                       开启自动播放：写 `autoplay` / `autoplay=1` / `autoplay=true`
+                       关闭自动播放：写 `noautoplay` / `autoplay=0`
+   - lazy（可选）    ：默认【开启懒加载】（loading="lazy"）。
+                       关闭懒加载（立即加载）：写 `nolazy` / `eager` / `lazy=0`
+                       开启懒加载：写 `lazy` / `lazy=1`
 
-4. 正式同步并清理本地已删除的卡片（带交互确认）：
-   python your_script.py ./notes --toanki --allow-delete
+3. 常用示例：
+   - 完整片段（分秒，默认懒加载、不自动播放）：
+     [ytv:4g5HOnKB4vY|21:05|23:33]
+   - 完整片段（秒数）：
+     [ytv:4g5HOnKB4vY|1265|1413]
+   - 仅指定开始时间 + 开启自动播放：
+     [ytv:4g5HOnKB4vY|21:05|autoplay]
+   - 仅指定结束时间 + 关闭懒加载：
+     [ytv:4g5HOnKB4vY||23:33|lazy=0]
+   - 播放整段视频：
+     [ytv:4g5HOnKB4vY]
 
 
-六、挂起状态管理与输出文件说明
-----------------------------------------------------------------------
-1. 挂起状态同步规则：
-   - Markdown 标记为 @suspended：强制将 Anki 中对应卡片设为挂起状态。
-   - Markdown 标记为 @active：强制将 Anki 中对应卡片解除挂起（恢复激活）。
-   - Markdown 未写任何状态标记：若卡片在 Anki 端已被手动挂起，脚本会尊重 Anki 端状态，不会自动取消挂起，并在控制台打印提示信息。
+五、md2anki.py 命令行使用与安全机制
+--------------------------------------------------------------------------------
+运行前请确保桌面端 Anki 已启动，且已安装并启用 AnkiConnect 插件（2055492159）。
 
-2. 输出文件目录结构（默认位于 data/ 目录下）：
-   - data/anki_export.tsv
-     每次运行均会生成，包含所有已解析卡片的 uuid、正面、背面、卡组、标签、挂起标记及来源文件路径。
-   - data/suspend_audit.csv
-     每次运行后覆盖生成（UTF-8 带 BOM 编码，可直接用 Excel 打开）。仅记录 Markdown 中未标记 @suspended 但 Anki 端当前处于 suspended 状态的卡片（包含列：uuid、anki状态、markdown状态、source），方便人工核对。
-   - data/delete_backup/anki_delete_backup_YYYYMMDD_HHMMSS.json
-     当触发 --allow-delete 删除操作前自动生成，完整备份待删除笔记的字段、标签与模板信息，防止误删数据丢失。
+1. 常用命令：
+   - 仅本地解析预览（不连接/不写入 Anki）：
+     python3 md2anki.py ./notes
+
+   - 差异预览（对比本地 Markdown 与 Anki 现有笔记的新增/更新/待删）：
+     python3 md2anki.py ./notes --diff
+
+   - 正式同步（新增与更新笔记，不删除 Anki 中多余笔记）：
+     python3 md2anki.py ./notes --toanki
+
+   - 正式同步并清理 Markdown 中已删除的笔记及空卡组：
+     python3 md2anki.py ./notes --toanki --allow-delete
+
+2. 常用 CLI 参数：
+   --append-tags   默认追加标签（默认: bear-app，逗号分隔）
+   --data-dir      数据与日志输出目录（默认: data）
+   --max-delete    单次允许删除的最大笔记数保护阈值（默认: 20，0 为不限制）
+   --yes, -y       删除笔记时跳过终端输入 DELETE 的交互确认
+   --quiet         安静模式，减少终端逐条输出
+
+3. 自动生成的审计与备份文件（默认位于 data/ 目录）：
+   - data/anki_export.tsv          : 全量标准化导出的 TSV 备份表
+   - data/suspend_audit.csv        : 挂起状态核对表（当 Anki 中卡片已手动挂起
+                                     而 Markdown 未写 @active 时，脚本会尊重
+                                     Anki 原有挂起状态并记录到此表）
+   - data/meta_dash_warnings.csv   : 非标准注释符号告警表（检测全角 `！` 或 `—`）
+   - data/delete_backup/*.json     : 执行删除前自动导出的待删笔记完整 JSON 快照
 
 
-七、安全与注意事项
-----------------------------------------------------------------------
-1. 全局 UUID 唯一性校验：若扫描发现不同卡片存在重复的 uuid，脚本会立即报错终止，不会执行推送、删除或导出。
-2. 模型变更保护：AnkiConnect 不支持直接修改已有笔记的模板类型（例如从 Basic 改为 Cloze）。若检测到同一 uuid 模板发生变化，脚本会自动跳过该卡片并提示手动处理。
-3. 卡组清理限制：启用 --allow-delete 后仅会自动清理已变为空的子卡组；若父卡组变为空，脚本仅输出警告提示，不会自动删除父卡组。
-======================================================================
+六、模板部署与跨平台播放配置
+--------------------------------------------------------------------------------
+1. 静态中转页部署（yt.html）：
+   - 将 yt.html 推送至 GitHub 仓库并开启 GitHub Pages，确保可通过 HTTPS
+     网页形式访问（当前配置为 https://love5201.github.io/yt.html）。
+   - 切勿使用 cdn.jsdelivr.net 作为中转页地址（其对 .html 返回 text/plain）。
+   - yt.html 支持查询参数：v（必填）、start、end、autoplay=1、nocookie=0
+     （默认使用 youtube-nocookie.com，遇极个别限制嵌入的视频可传 nocookie=0）。
+
+2. 解除 macOS 桌面端自动播放拦截：
+   - AnkiMobile（iOS WKWebView）支持有声自动播放，但 macOS 桌面端 Anki 使用
+     Chromium 内核（QtWebEngine），默认拦截跨源 iframe 的有声自动播放。
+   - 在 macOS 终端执行以下命令写入开机自启配置，即可在桌面端放行有声自动播放：
+
+     cat << 'EOF' > ~/Library/LaunchAgents/com.user.anki.autoplay.plist
+     <?xml version="1.0" encoding="UTF-8"?>
+     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+     <plist version="1.0">
+     <dict>
+       <key>Label</key>
+       <string>com.user.anki.autoplay</string>
+       <key>ProgramArguments</key>
+       <array>
+         <string>/bin/launchctl</string>
+         <string>setenv</string>
+         <string>QTWEBENGINE_CHROMIUM_FLAGS</string>
+         <string>--autoplay-policy=no-user-gesture-required</string>
+       </array>
+       <key>RunAtLoad</key>
+       <true/>
+     </dict>
+     </plist>
+     EOF
+     launchctl load ~/Library/LaunchAgents/com.user.anki.autoplay.plist
+
+   - 执行后按 Cmd + Q 完全退出并重启 Anki 即可生效。
+
+3. 模板细节说明：
+   - 背面模板的 PROXY_BASE_URL 需与实际部署的 yt.html 地址保持一致。
+   - 若背面模板中的 parseYtvShortcode 尚未更新为支持 autoplay / lazy 旗标的
+     版本，请确保使用包含 `autoplay` 与 `lazy` 参数解析的最新版模板脚本。
+================================================================================

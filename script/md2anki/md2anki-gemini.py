@@ -70,6 +70,80 @@ MIME_TYPES = {
 CUSTOM_KV_LINE_PATTERN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)[ \t]*:[ \t]*(.*)$")
 
 
+IFRAME_BLOCK_PATTERN = re.compile(r"<iframe\b[^>]*>[\s\S]*?</iframe>", re.IGNORECASE)
+ESCAPED_BEAR_LINK_PATTERN = re.compile(r"\[\\{1,2}\[([^\]]+)\\{1,2}\]\]\(([^)]+)\)")
+CUSTOM_SCHEME_MD_LINK_PATTERN = re.compile(r"(?<!!)\[([^\]]+)\]\(((?!https?://|mailto:|tel:|#|/)([a-zA-Z][a-zA-Z0-9+.-]*://[^)]+))\)")
+
+
+IFRAME_OPEN_TAG_PATTERN = re.compile(r"^<iframe\b([^>]*)>(.*?)</iframe>$", re.IGNORECASE | re.DOTALL)
+IFRAME_STYLE_ATTR_PATTERN = re.compile(r'style=(?:"([^"]*)"|\'([^\']*)\')', re.IGNORECASE)
+
+
+def _compact_iframe_match(match: re.Match) -> str:
+    raw = match.group(0)
+    compact = re.sub(r"\s+", " ", raw).replace("> <", "><").strip()
+    m = IFRAME_OPEN_TAG_PATTERN.match(compact)
+    if m:
+        attrs = m.group(1)
+        inner = m.group(2)
+        if not re.search(r"\bstyle\s*=", attrs, re.IGNORECASE):
+            attrs = f'{attrs} style="width:100%;min-height:240px;border:0;display:block;"'
+        else:
+            def _patch_style(sm: re.Match) -> str:
+                st = (sm.group(1) if sm.group(1) is not None else sm.group(2) or "").strip()
+                if "display" not in st.lower():
+                    st = f"{st}; display:block;" if st and not st.endswith(";") else f"{st} display:block;"
+                if "height" not in st.lower() and "min-height" not in st.lower():
+                    st = f"{st} min-height:240px;"
+                if "width" not in st.lower():
+                    st = f"{st} width:100%;"
+                return f'style="{st.strip()}"'
+            attrs = IFRAME_STYLE_ATTR_PATTERN.sub(_patch_style, attrs, count=1)
+        if not re.search(r"\ballow\s*=", attrs, re.IGNORECASE):
+            attrs = f'{attrs} allow="autoplay; fullscreen; encrypted-media; picture-in-picture"'
+        compact = f"<iframe{attrs}>{inner}</iframe>"
+    return f"\n\n{compact}\n\n"
+
+
+def normalize_card_content(text: str) -> str:
+    if not text:
+        return text
+    s = text.replace("\r\n", "\n")
+    s = ESCAPED_BEAR_LINK_PATTERN.sub(r"[\1](\2)", s)
+    s = CUSTOM_SCHEME_MD_LINK_PATTERN.sub(r'<a href="\2">\1</a>', s)
+    s = IFRAME_BLOCK_PATTERN.sub(_compact_iframe_match, s)
+
+    lines = s.split("\n")
+    out_lines: List[str] = []
+    for idx, line in enumerate(lines):
+        next_line = lines[idx + 1] if idx + 1 < len(lines) else None
+        cur_is_list = bool(LIST_HEAD_PATTERN.match(line))
+        next_is_list = bool(next_line is not None and LIST_HEAD_PATTERN.match(next_line))
+        next_is_blank = bool(next_line is not None and not next_line.strip())
+        next_is_iframe = bool(next_line is not None and next_line.lstrip().lower().startswith("<iframe"))
+        cur_is_iframe = line.lstrip().lower().startswith("<iframe")
+
+        if (
+            next_line is not None
+            and line.strip()
+            and not next_is_blank
+            and not cur_is_list
+            and not next_is_list
+            and not cur_is_iframe
+            and not next_is_iframe
+            and not line.rstrip().endswith("<br>")
+        ):
+            out_lines.append(f"{line}<br>")
+        else:
+            out_lines.append(line)
+
+    joined = "\n".join(out_lines)
+    joined = re.sub(r"\n{3,}", "\n\n", joined).strip()
+    return joined.replace("\n", "<br>")
+
+
+
+
 @dataclass
 class Card:
     uuid: str
@@ -767,7 +841,7 @@ def parse_custom_notetype_block(
 
     for k in list(fields_map.keys()):
         cleaned_v = strip_comments(fields_map[k]).strip()
-        fields_map[k] = cleaned_v.replace("\r\n", "<br>").replace("\n", "<br>")
+        fields_map[k] = normalize_card_content(cleaned_v)
 
     audio_items, image_items = split_media_tags_by_type(trailing_back_items or [])
 
@@ -1320,13 +1394,13 @@ def export_tsv(cards: List[Card], out_path: Path):
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         for c in cards:
             tag_str = ",".join(c.tags)
-            front_clean = c.front.replace("\t", " ").replace("\r\n", "<br>").replace("\n", "<br>")
+            front_clean = normalize_card_content(c.front).replace("\t", " ")
             if c.note_type:
                 extra_parts = [f"{k}={v}" for k, v in c.custom_fields.items()]
                 back_raw = " | ".join(extra_parts)
             else:
                 back_raw = c.back
-            back_clean = back_raw.replace("\t", " ").replace("\r\n", "<br>").replace("\n", "<br>")
+            back_clean = normalize_card_content(back_raw).replace("\t", " ")
             md_suspend_label = c.suspend_action or ""
             f.write(
                 f"{c.uuid}\t{front_clean}\t{back_clean}\t{c.deck}\t{tag_str}\t{md_suspend_label}\t{c.source_file}\n"
@@ -1554,7 +1628,7 @@ def push_to_anki(
         for c in cards:
             print(c)
         return
-    print("===== 🚀 正式推送模式 =====")
+    print("===== 🚀 正式推送模式 (md2anki v3.10) =====")
     local_uuid_set = {c.uuid for c in cards}
     deck_list: List[str] = anki_invoke("deckNames")
     empty_deck_candidates: Set[str] = set()
@@ -1599,21 +1673,49 @@ def push_to_anki(
                 if allowed_fields and "source" in allowed_fields:
                     fields["source"] = card.source_file
             elif card.card_type == "basic":
-                fields = {
-                    "front": card.front,
-                    "back": card.back,
-                    "uuid": card.uuid,
-                    "source": card.source_file,
-                }
                 model_name = card.model_name
+                if model_name not in model_fields_cache:
+                    try:
+                        fnames = anki_invoke("modelFieldNames", {"modelName": model_name}) or []
+                        model_fields_cache[model_name] = set(fnames)
+                    except Exception as e:
+                        print(f"⚠️ 获取模板 [{model_name}] 字段列表失败: {e}")
+                        model_fields_cache[model_name] = set()
+                allowed_fields = model_fields_cache.get(model_name, set())
+                key_map = {fn.lower(): fn for fn in allowed_fields}
+                front_key = key_map.get("front", "front")
+                back_key = key_map.get("back", "back")
+                uuid_key = key_map.get("uuid", "uuid")
+                source_key = key_map.get("source", "source")
+                fields = {
+                    front_key: normalize_card_content(card.front),
+                    back_key: normalize_card_content(card.back),
+                    uuid_key: card.uuid,
+                }
+                if not allowed_fields or source_key in allowed_fields:
+                    fields[source_key] = card.source_file
             else:
-                fields = {
-                    "text": card.front,
-                    "extra": card.back,
-                    "uuid": card.uuid,
-                    "source": card.source_file,
-                }
                 model_name = card.model_name
+                if model_name not in model_fields_cache:
+                    try:
+                        fnames = anki_invoke("modelFieldNames", {"modelName": model_name}) or []
+                        model_fields_cache[model_name] = set(fnames)
+                    except Exception as e:
+                        print(f"⚠️ 获取模板 [{model_name}] 字段列表失败: {e}")
+                        model_fields_cache[model_name] = set()
+                allowed_fields = model_fields_cache.get(model_name, set())
+                key_map = {fn.lower(): fn for fn in allowed_fields}
+                text_key = key_map.get("text", "text")
+                extra_key = key_map.get("extra", "extra")
+                uuid_key = key_map.get("uuid", "uuid")
+                source_key = key_map.get("source", "source")
+                fields = {
+                    text_key: normalize_card_content(card.front),
+                    extra_key: normalize_card_content(card.back),
+                    uuid_key: card.uuid,
+                }
+                if not allowed_fields or source_key in allowed_fields:
+                    fields[source_key] = card.source_file
 
             if existing is not None:
                 note_id = existing["noteId"]
@@ -1621,7 +1723,8 @@ def push_to_anki(
                 anki_invoke("updateNoteTags", {"note": note_id, "tags": card.tags})
                 card_ids: List[int] = existing.get("cards") or anki_invoke("findCards", {"query": f"nid:{note_id}"})
                 if not quiet:
-                    print(f"♻️ 更新笔记 note_id={note_id}, card_ids={card_ids}")
+                    br_cnt = sum(str(v).count("<br>") for v in fields.values())
+                    print(f"♻️ 更新笔记 note_id={note_id}, card_ids={card_ids}, 字段={list(fields.keys())}, <br>总数={br_cnt}")
                 if card_ids:
                     deck_map = anki_invoke("getDecks", {"cards": card_ids})
                     old_decks = [d for d in deck_map.keys() if d != card.deck]
@@ -1644,7 +1747,8 @@ def push_to_anki(
                     },
                 )
                 card_ids = anki_invoke("findCards", {"query": f"nid:{note_id}"})
-                print(f"➕ 新增笔记 uuid={card.uuid}, note_id={note_id}, card_ids={card_ids}")
+                br_cnt = sum(str(v).count("<br>") for v in fields.values())
+                print(f"➕ 新增笔记 uuid={card.uuid}, note_id={note_id}, card_ids={card_ids}, 字段={list(fields.keys())}, <br>总数={br_cnt}")
 
             if card_ids:
                 if card.suspend_action == "suspended":

@@ -1,5 +1,5 @@
 ================================================================================
-                    md2anki (v3.16) 完整使用与维护手册
+                    md2anki (v3.17) 完整使用与维护手册
 ================================================================================
 
 md2anki 是一套面向 Bear / Markdown 笔记的 Anki 自动化制卡与跨平台渲染方案，
@@ -14,7 +14,7 @@ md2anki 是一套面向 Bear / Markdown 笔记的 Anki 自动化制卡与跨平�
 一、核心组件清单
 --------------------------------------------------------------------------------
 
-1. md2anki-v3_16.py
+1. md2anki-v3_17.py
    Python 命令行同步脚本。负责扫描 Markdown 目录、解析卡片、处理本地/Base64
    图片与音视频、调用 edge-tts 预合成语音、通过 AnkiConnect 推送至 Anki，并
    导出核对报表与删除备份。
@@ -192,7 +192,8 @@ Phonetic_Notes: /ˈhændbæɡ/
      [tts:氨弹涤耐磨，莱滑莫吸垂]
    - 保留正文并附带语音（加 |show）：
      [tts:Excuse me. Is this your handbag?|show]
-   - 指定音色、语速与音调：
+   - 指定场景别名、音色、语速与音调：
+     [tts:核心原理拆解|干货解说|show]
      [tts:handbag|word|slow|show]
      [tts:慢速朗读测试|xiaoyi|rate=-20%|pitch=+5Hz|show]
 
@@ -200,23 +201,25 @@ Phonetic_Notes: /ˈhændbæɡ/
    - 含中文字符时默认使用：zh-CN-XiaoxiaoNeural（晓晓女声）
    - 纯英文/其他文本默认使用：en-US-EmmaMultilingualNeural（Emma 美音女声）
 
-3. 内置音色简写对照表（也支持 voice=完整音色名）
-   简写                           对应 Microsoft Neural 音色
-   --------------------------------------------------------------------------
-   zh / cn / zh-f / xiaoxiao      zh-CN-XiaoxiaoNeural（中文女声，默认）
-   xiaoyi                         zh-CN-XiaoyiNeural（中文女声，年轻清脆）
-   zh-m / cn-m / yunxi            zh-CN-YunxiNeural（中文男声）
-   zh-tw                          zh-TW-HsiaoChenNeural（台湾女声）
-   zh-hk                          zh-HK-HiuGaaiNeural（粤语女声）
-   us / en / en-us / emma / sentence  en-US-EmmaMultilingualNeural（美音例句，默认）
-   ava / dialog                   en-US-AvaMultilingualNeural（美音对话，舒缓）
-   aria                           en-US-AriaNeural（美音女声，清晰播报）
-   jenny / word                   en-US-JennyNeural（美音单词，干脆清晰）
-   us-m                           en-US-GuyNeural（美音男声）
-   uk / en-gb / sonia             en-GB-SoniaNeural（英音女声，标准平稳）
-   libby                          en-GB-LibbyNeural（英音女声，年轻轻快）
-   uk-m                           en-GB-RyanNeural（英音男声）
-   jp / ja                        ja-JP-NanamiNeural（日语女声）
+3. 内置音色简写对照表（也支持 voice=完整音色名 或 voice=简写别名）
+   简写                                       对应 Microsoft Neural 音色
+   ----------------------------------------------------------------------------------
+   zh / cn / zh-f / xiaoxiao / 晓晓 / 日常对话  zh-CN-XiaoxiaoNeural（中文女声，默认）
+   xiaoyi                                     zh-CN-XiaoyiNeural（中文女声，年轻清脆）
+   zh-m / cn-m / yunxi / 云希 / 短视频          zh-CN-YunxiNeural（中文男声）
+   干货解说 / 云扬                              zh-CN-YunyangNeural（中文男声，沉稳解说）
+   学术商务 / 云间                              zh-CN-YunjianNeural（中文男声，专业播报）
+   zh-tw                                      zh-TW-HsiaoChenNeural（台湾女声）
+   zh-hk                                      zh-HK-HiuGaaiNeural（粤语女声）
+   us / en / en-us / emma / sentence          en-US-EmmaMultilingualNeural（美音例句，默认）
+   ava / dialog                               en-US-AvaMultilingualNeural（美音对话，舒缓）
+   aria                                       en-US-AriaNeural（美音女声，清晰播报）
+   jenny / word                               en-US-JennyNeural（美音单词，干脆清晰）
+   us-m                                       en-US-GuyNeural（美音男声）
+   uk / en-gb / sonia                         en-GB-SoniaNeural（英音女声，标准平稳）
+   libby                                      en-GB-LibbyNeural（英音女声，年轻轻快）
+   uk-m                                       en-GB-RyanNeural（英音男声）
+   jp / ja                                    ja-JP-NanamiNeural（日语女声）
 
 4. 语速、音调与显示开关
    - 显示控制：show / text / keep / show=1（保留原文）；hide / show=0（仅语音，默认）
@@ -225,7 +228,7 @@ Phonetic_Notes: /ˈhændbæɡ/
 
 5. 多音字与注音处理（三重机制，按优先级生效）
    (1) 行内替读 {原词=替读}（最高优先级）：
-       例：[tts:氨{弹=谈}{涤=敌}耐磨|show]
+       例：[tts:氨{弹=谈}{涤=敌}耐磨|日常对话|show]
        卡片显示为“氨弹涤耐磨”，实际喂给 TTS 朗读“氨谈敌耐磨”。
        与 {{挖空}} 完全兼容，互不冲突。
    (2) 自动剥离方括号注音/音标：
@@ -270,19 +273,19 @@ Phonetic_Notes: /ˈhændbæɡ/
 常用命令示例：
 
 1. 仅本地解析预览（不连接 Anki，不合成 TTS）：
-   python3 md2anki-v3_16.py ./notes
+   python3 md2anki-v3_17.py ./notes
 
 2. 差异预览（连接 Anki 对比新增/更新/待删，不改动数据）：
-   python3 md2anki-v3_16.py ./notes --diff
+   python3 md2anki-v3_17.py ./notes --diff
 
 3. 正式同步写入 Anki（含图片/音视频上传与 TTS 合成）：
-   python3 md2anki-v3_16.py ./notes --toanki
+   python3 md2anki-v3_17.py ./notes --toanki
 
 4. 正式同步 + 清理 Markdown 中已删除的卡片与空卡组：
-   python3 md2anki-v3_16.py ./notes --toanki --allow-delete
+   python3 md2anki-v3_17.py ./notes --toanki --allow-delete
 
 5. 安静模式 + 离线跳过 TTS：
-   python3 md2anki-v3_16.py ./notes --toanki --quiet --no-tts
+   python3 md2anki-v3_17.py ./notes --toanki --quiet --no-tts
 
 完整参数列表：
   dir                       待扫描的 Markdown 笔记目录（默认：./notes）

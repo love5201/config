@@ -28,10 +28,18 @@ TTS_VOICE_PRESETS: Dict[str, str] = {
     "cn": "zh-CN-XiaoxiaoNeural",
     "zh-f": "zh-CN-XiaoxiaoNeural",
     "xiaoxiao": "zh-CN-XiaoxiaoNeural",
+    "晓晓": "zh-CN-XiaoxiaoNeural",
+    "日常对话": "zh-CN-XiaoxiaoNeural",
     "xiaoyi": "zh-CN-XiaoyiNeural",
     "zh-m": "zh-CN-YunxiNeural",
     "cn-m": "zh-CN-YunxiNeural",
     "yunxi": "zh-CN-YunxiNeural",
+    "云希": "zh-CN-YunxiNeural",
+    "短视频": "zh-CN-YunxiNeural",
+    "干货解说": "zh-CN-YunyangNeural",
+    "云扬": "zh-CN-YunyangNeural",
+    "学术商务": "zh-CN-YunjianNeural",
+    "云间": "zh-CN-YunjianNeural",
     "zh-tw": "zh-TW-HsiaoChenNeural",
     "zh-hk": "zh-HK-HiuGaaiNeural",
     "us": "en-US-EmmaMultilingualNeural",
@@ -659,7 +667,7 @@ def parse_tts_shortcode_body(
             end_idx -= 1
             continue
 
-        m_voice = re.match(r"^voice\s*=\s*([A-Za-z0-9_-]+)$", token, re.IGNORECASE)
+        m_voice = re.match(r"^voice\s*=\s*([\w-]+)$", token, re.IGNORECASE)
         if m_voice:
             v_val = m_voice.group(1).strip()
             voice = TTS_VOICE_PRESETS.get(v_val.lower(), v_val)
@@ -1971,7 +1979,7 @@ def push_to_anki(
         for c in cards:
             print(c)
         return
-    print("===== 🚀 正式推送模式 (md2anki v3.16) =====")
+    print("===== 🚀 正式推送模式 (md2anki v3.17) =====")
     local_uuid_set = {c.uuid for c in cards}
     deck_list: List[str] = anki_invoke("deckNames")
     empty_deck_candidates: Set[str] = set()

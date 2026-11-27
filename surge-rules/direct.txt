@@ -42,3 +42,4 @@
 .chinaunicom.cn
 .tencent.com
 .heptabase.com
+.speech.platform.bing.com
